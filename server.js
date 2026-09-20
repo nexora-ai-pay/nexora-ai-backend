@@ -107,21 +107,12 @@ app.get("/api/users/count", async (req, res) => {
 
 app.post("/api/users", requireTelegramUser, async (req, res) => {
   try {
-    const {
-      telegram_id,
-      username = "",
-      first_name = "",
-      last_name = "",
-      referral_code = ""
-    } = req.body;
-
-    if (!telegram_id) {
-      return res.status(400).json({
-        success: false,
-        message: "telegram_id is required"
-      });
-    }
-
+const { referral_code = "" } = req.body;
+const telegramUser = req.telegramUser;
+const telegram_id = String(telegramUser.id);
+const username = telegramUser.username || "";
+const first_name = telegramUser.first_name || "";
+const last_name = telegramUser.last_name || "";
     await db.read();
 
     let user = db.data.users.find(
