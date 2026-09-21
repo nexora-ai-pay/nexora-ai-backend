@@ -361,6 +361,230 @@ app.post("/api/deposits/:id/verify", async (req, res) => {
   }
 });
 
+
+// ==================== FRONTEND API ROUTES ====================
+
+// Current authenticated user's balance/profile.
+app.get("/api/balance", requireTelegramUser, async (req, res) => {
+  try {
+    await db.read();
+
+    const telegramId = String(req.telegramUser.id);
+
+    const user = db.data.users.find(
+      u => String(u.telegram_id) === telegramId
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      user
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load balance"
+    });
+  }
+});
+
+
+// Referral information for the authenticated user.
+app.get("/api/referral", requireTelegramUser, async (req, res) => {
+  try {
+    await db.read();
+
+    const telegramId = String(req.telegramUser.id);
+
+    const user = db.data.users.find(
+      u => String(u.telegram_id) === telegramId
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    const referralCode = String(user.referral_code || "");
+
+    const referredUsers = db.data.users.filter(
+      u =>
+        String(u.referred_by || "").trim().toLowerCase() ===
+        referralCode.trim().toLowerCase()
+    );
+
+    const verifiedDeposits = db.data.deposits.filter(
+      d =>
+        String(d.status || "").toLowerCase() === "verified" &&
+        referredUsers.some(
+          u => String(u.telegram_id) === String(d.telegram_id)
+        )
+    );
+
+    const totalCommission = verifiedDeposits.reduce(
+      (sum, d) => sum + Number(d.referral_commission || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      referral_code: referralCode,
+      referral_count: referredUsers.length,
+      total_commission: Number(totalCommission.toFixed(8))
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load referral data"
+    });
+  }
+});
+
+
+// Deposit history for the authenticated user.
+app.get("/api/deposits", requireTelegramUser, async (req, res) => {
+  try {
+    await db.read();
+
+    const telegramId = String(req.telegramUser.id);
+
+    const deposits = db.data.deposits
+      .filter(d => String(d.telegram_id) === telegramId)
+      .sort(
+        (a, b) =>
+          new Date(b.created_at || 0) -
+          new Date(a.created_at || 0)
+      );
+
+    res.json({
+      success: true,
+      deposits
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load deposit history"
+    });
+  }
+});
+
+
+// Create a pending withdrawal request.
+// Actual payment processing is NOT performed here.
+app.post("/api/withdrawals", requireTelegramUser, async (req, res) => {
+  try {
+    const amount = Number(req.body.amount);
+    const address = String(req.body.address || "").trim();
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid withdrawal amount"
+      });
+    }
+
+    if (!address) {
+      return res.status(400).json({
+        success: false,
+        message: "Withdrawal address is required"
+      });
+    }
+
+    await db.read();
+
+    const telegramId = String(req.telegramUser.id);
+
+    const user = db.data.users.find(
+      u => String(u.telegram_id) === telegramId
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    const balance = Number(user.balance || 0);
+
+    if (amount > balance) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient balance"
+      });
+    }
+
+    const withdrawal = {
+      id:
+        Date.now() +
+        "-" +
+        Math.random().toString(36).slice(2, 10),
+      telegram_id: telegramId,
+      amount,
+      address,
+      status: "pending",
+      created_at: new Date().toISOString(),
+      processed_at: null
+    };
+
+    db.data.withdrawals.push(withdrawal);
+
+    await db.write();
+
+    res.json({
+      success: true,
+      message: "Withdrawal request submitted and marked pending",
+      withdrawal
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create withdrawal request"
+    });
+  }
+});
+
+
+// Withdrawal history for the authenticated user.
+app.get("/api/withdrawals", requireTelegramUser, async (req, res) => {
+  try {
+    await db.read();
+
+    const telegramId = String(req.telegramUser.id);
+
+    const withdrawals = db.data.withdrawals
+      .filter(w => String(w.telegram_id) === telegramId)
+      .sort(
+        (a, b) =>
+          new Date(b.created_at || 0) -
+          new Date(a.created_at || 0)
+      );
+
+    res.json({
+      success: true,
+      withdrawals
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load withdrawal history"
+    });
+  }
+});
+
 async function startServer() {
   try {
     await initDatabase();
