@@ -34,6 +34,7 @@ function verifyTelegramWebAppData(initData) {
   if (calculatedHash !== receivedHash) return null;
 
   const userData = params.get("user");
+
   if (!userData) return null;
 
   try {
@@ -42,6 +43,7 @@ function verifyTelegramWebAppData(initData) {
     return null;
   }
 }
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -55,6 +57,7 @@ app.use(
 );
 
 app.use(express.json());
+
 function requireTelegramUser(req, res, next) {
   const initData = req.headers["x-telegram-init-data"];
 
@@ -63,13 +66,14 @@ function requireTelegramUser(req, res, next) {
   if (!user) {
     return res.status(401).json({
       success: false,
-      message: "Invalid Telegram authentication"
+      message: "Invalid Telegram authentication",
     });
   }
 
   req.telegramUser = user;
   next();
 }
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -173,20 +177,6 @@ app.post("/api/users", requireTelegramUser, async (req, res) => {
 
       user.updated_at = new Date().toISOString();
     }
-
-    await db.write();
-
-    res.json({
-      success: true,
-      user
-    });
-  } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to save user"
-    });
   }
 });
 
@@ -368,15 +358,38 @@ async function startServer() {
   try {
     await initDatabase();
 
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log("=================================");
-      console.log("   NEXORA AI BACKEND STARTED");
-      console.log("=================================");
-      console.log(`Port: ${PORT}`);
-      console.log("Database: Connected");
-    });
+    app.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          "================================="
+        );
+
+        console.log(
+          "   NEXORA AI BACKEND STARTED"
+        );
+
+        console.log(
+          "================================="
+        );
+
+        console.log(
+          `Port: ${PORT}`
+        );
+
+        console.log(
+          "Database: Connected"
+        );
+      }
+    );
+
   } catch (error) {
-    console.error("Failed to start backend:", error);
+    console.error(
+      "Failed to start backend:",
+      error
+    );
+
     process.exit(1);
   }
 }
