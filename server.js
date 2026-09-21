@@ -178,6 +178,13 @@ app.post("/api/users", requireTelegramUser, async (req, res) => {
       user.updated_at = new Date().toISOString();
     }
   }
+  catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save user"
+    });
+  }
 });
 
 
