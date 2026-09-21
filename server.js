@@ -177,6 +177,11 @@ app.post("/api/users", requireTelegramUser, async (req, res) => {
 
       user.updated_at = new Date().toISOString();
     }
+await db.write();
+    return res.json({
+      success: true,
+      user
+    });
   }
   catch (error) {
     console.error(error);
