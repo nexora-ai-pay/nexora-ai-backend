@@ -15,7 +15,8 @@ const adapter = new JSONFile(file);
 const defaultData = {
   users: [],
   deposits: [],
-  withdrawals: []
+  withdrawals: [],
+  nft_purchases: []
 };
 
 const db = new Low(adapter, defaultData);
@@ -24,9 +25,11 @@ async function initDatabase() {
   await db.read();
 
   db.data ||= defaultData;
+
   db.data.users ||= [];
   db.data.deposits ||= [];
   db.data.withdrawals ||= [];
+  db.data.nft_purchases ||= [];
 
   await db.write();
 
