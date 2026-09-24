@@ -58,6 +58,26 @@ app.use(
 
 app.use(express.json());
 
+
+function generateUniqueDepositAmount(requestedAmount, deposits) {
+  const base = Math.round(Number(requestedAmount) * 1000) / 1000;
+
+  for (let i = 1; i <= 999; i++) {
+    const candidate = Number((base + (i / 1000000)).toFixed(6));
+
+    const used = deposits.some((d) =>
+      d.status === "pending" &&
+      Number(d.amount) === candidate
+    );
+
+    if (!used) {
+      return candidate;
+    }
+  }
+
+  throw new Error("No unique deposit amount available");
+}
+
 function requireTelegramUser(req, res, next) {
   const initData = req.headers["x-telegram-init-data"];
 
@@ -223,10 +243,19 @@ app.post("/api/deposits", requireTelegramUser, async (req, res) => {
       });
     }
 
+    const uniqueAmount = generateUniqueDepositAmount(
+      amount,
+      db.data.deposits
+    );
+
     const deposit = {
       id: "DEP-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
       telegram_id: telegramId,
-      amount,
+      requested_amount: amount,
+      amount: uniqueAmount,
+      deposit_address: process.env.DEPOSIT_WALLET_ADDRESS,
+      network: "BEP-20",
+      token: "USDT",
       status: "pending",
       referral_commission: 0,
       commission_credited: false,
