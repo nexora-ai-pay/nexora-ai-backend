@@ -216,7 +216,23 @@ await db.write();
 // ==================== DEPOSIT SYSTEM ====================
 // Deposit requests stay PENDING until securely verified.
 // Referral commission: 5% of verified deposit.
+app.get("/api/deposit-config", (req, res) => {
+  const address = String(process.env.DEPOSIT_WALLET_ADDRESS || "").trim();
 
+  if (!address) {
+    return res.status(503).json({
+      success: false,
+      message: "Deposit wallet address is not configured"
+    });
+  }
+
+  res.json({
+    success: true,
+    deposit_address: address,
+    network: "BEP-20",
+    token: "USDT"
+  });
+});
 app.post("/api/deposits", requireTelegramUser, async (req, res) => {
   try {
     const amount = Number(req.body.amount);
