@@ -609,7 +609,315 @@ async function startServer() {
   try {
     await initDatabase();
 
-    app.listen(
+    
+
+// NEXORA_ADMIN_V1_START
+
+function requireAdmin(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+
+  if (!secret) {
+    return res.status(503).json({
+      success: false,
+      message: "ADMIN_SECRET is not configured"
+    });
+  }
+
+  if (req.headers["x-admin-secret"] !== secret) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized"
+    });
+  }
+
+  next();
+}
+
+// Admin dashboard
+app.get("/api/admin/dashboard", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+
+    db.data.users ||= [];
+    db.data.deposits ||= [];
+    db.data.withdrawals ||= [];
+    db.data.nft_purchases ||= [];
+
+    const verifiedDeposits = db.data.deposits.filter(
+      d => d.status === "verified"
+    );
+
+    const pendingDeposits = db.data.deposits.filter(
+      d => d.status === "pending"
+    );
+
+    const pendingWithdrawals = db.data.withdrawals.filter(
+      w => w.status === "pending"
+    );
+
+    const processedWithdrawals = db.data.withdrawals.filter(
+      w => w.status === "processed"
+    );
+
+    const totalBalance = db.data.users.reduce(
+      (s, u) => s + Number(u.balance || 0),
+      0
+    );
+
+    const totalEarned = db.data.users.reduce(
+      (s, u) => s + Number(u.total_earned || 0),
+      0
+    );
+
+    const totalDeposits = verifiedDeposits.reduce(
+      (s, d) => s + Number(d.amount || 0),
+      0
+    );
+
+    const totalWithdrawals = processedWithdrawals.reduce(
+      (s, w) => s + Number(w.amount || 0),
+      0
+    );
+
+    const totalCommission = db.data.nft_purchases.reduce(
+      (s, p) => s + Number(p.referral_commission || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      stats: {
+        users: db.data.users.length,
+        pending_deposits: pendingDeposits.length,
+        verified_deposits: verifiedDeposits.length,
+        pending_withdrawals: pendingWithdrawals.length,
+        processed_withdrawals: processedWithdrawals.length,
+        nft_purchases: db.data.nft_purchases.length,
+        total_balance: Number(totalBalance.toFixed(8)),
+        total_earned: Number(totalEarned.toFixed(8)),
+        total_deposits: Number(totalDeposits.toFixed(8)),
+        total_withdrawals: Number(totalWithdrawals.toFixed(8)),
+        total_referral_commission: Number(totalCommission.toFixed(8))
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load admin dashboard"
+    });
+  }
+});
+
+// Admin users
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+    db.data.users ||= [];
+
+    res.json({
+      success: true,
+      count: db.data.users.length,
+      users: db.data.users
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load users"
+    });
+  }
+});
+
+// Admin deposits
+app.get("/api/admin/deposits", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+    db.data.deposits ||= [];
+
+    const deposits = [...db.data.deposits].sort(
+      (a, b) =>
+        new Date(b.created_at || 0) -
+        new Date(a.created_at || 0)
+    );
+
+    res.json({
+      success: true,
+      count: deposits.length,
+      deposits
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load deposits"
+    });
+  }
+});
+
+// Admin withdrawals
+app.get("/api/admin/withdrawals", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+    db.data.withdrawals ||= [];
+
+    const withdrawals = [...db.data.withdrawals].sort(
+      (a, b) =>
+        new Date(b.created_at || 0) -
+        new Date(a.created_at || 0)
+    );
+
+    res.json({
+      success: true,
+      count: withdrawals.length,
+      withdrawals
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load withdrawals"
+    });
+  }
+});
+
+// Admin NFT purchases
+app.get("/api/admin/nft-purchases", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+    db.data.nft_purchases ||= [];
+
+    res.json({
+      success: true,
+      count: db.data.nft_purchases.length,
+      purchases: db.data.nft_purchases
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to load NFT purchases"
+    });
+  }
+});
+
+// Process withdrawal
+app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+
+    db.data.withdrawals ||= [];
+    db.data.users ||= [];
+
+    const withdrawal = db.data.withdrawals.find(
+      w => String(w.id) === String(req.params.id)
+    );
+
+    if (!withdrawal) {
+      return res.status(404).json({
+        success: false,
+        message: "Withdrawal not found"
+      });
+    }
+
+    if (withdrawal.status !== "pending") {
+      return res.status(409).json({
+        success: false,
+        message: "Withdrawal already processed"
+      });
+    }
+
+    const user = db.data.users.find(
+      u => String(u.telegram_id) === String(withdrawal.telegram_id)
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    const amount = Number(withdrawal.amount || 0);
+    const balance = Number(user.balance || 0);
+
+    if (amount <= 0 || amount > balance) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or insufficient balance"
+      });
+    }
+
+    user.balance = Number((balance - amount).toFixed(8));
+    user.updated_at = new Date().toISOString();
+
+    withdrawal.status = "processed";
+    withdrawal.processed_at = new Date().toISOString();
+
+    await db.write();
+
+    res.json({
+      success: true,
+      message: "Withdrawal marked as processed",
+      withdrawal,
+      user_balance: user.balance
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to process withdrawal"
+    });
+  }
+});
+
+// Reject withdrawal
+app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    await db.read();
+
+    db.data.withdrawals ||= [];
+
+    const withdrawal = db.data.withdrawals.find(
+      w => String(w.id) === String(req.params.id)
+    );
+
+    if (!withdrawal) {
+      return res.status(404).json({
+        success: false,
+        message: "Withdrawal not found"
+      });
+    }
+
+    if (withdrawal.status !== "pending") {
+      return res.status(409).json({
+        success: false,
+        message: "Withdrawal already processed"
+      });
+    }
+
+    withdrawal.status = "rejected";
+    withdrawal.rejected_at = new Date().toISOString();
+
+    await db.write();
+
+    res.json({
+      success: true,
+      message: "Withdrawal rejected",
+      withdrawal
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to reject withdrawal"
+    });
+  }
+});
+
+// NEXORA_ADMIN_V1_END
+
+app.listen(
       PORT,
       "0.0.0.0",
       () => {
