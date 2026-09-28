@@ -915,6 +915,219 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
   }
 });
 
+
+
+// ================= NFT LIVE MINING ENGINE =================
+
+let miningSettlementRunning = false;
+
+function calculateNFTDailyEarning(purchase) {
+  const price = Number(purchase.price || 0);
+  const rate = Number(purchase.daily_rate || 0);
+
+  return Number((price * rate / 100).toFixed(8));
+}
+
+async function settleNFTMining() {
+  if (miningSettlementRunning) return;
+
+  miningSettlementRunning = true;
+
+  try {
+    await db.read();
+
+    db.data.users ||= [];
+    db.data.nft_purchases ||= [];
+
+    const nowMs = Date.now();
+    let changed = false;
+
+    for (const purchase of db.data.nft_purchases) {
+      if (!purchase || !purchase.telegram_id) continue;
+
+      const durationDays = Number(purchase.duration_days || 0);
+
+      if (durationDays <= 0) continue;
+
+      const purchasedMs = new Date(
+        purchase.purchased_at || purchase.created_at || Date.now()
+      ).getTime();
+
+      if (!Number.isFinite(purchasedMs)) continue;
+
+      // Initialize mining state for existing purchases.
+      if (!purchase.mined_cycles) {
+        purchase.mined_cycles = 0;
+        changed = true;
+      }
+
+      if (!purchase.daily_earning) {
+        purchase.daily_earning = calculateNFTDailyEarning(purchase);
+        changed = true;
+      }
+
+      if (!purchase.next_mining_at) {
+        purchase.next_mining_at = new Date(
+          purchasedMs + 24 * 60 * 60 * 1000
+        ).toISOString();
+        changed = true;
+      }
+
+      if (!purchase.total_mined) {
+        purchase.total_mined = 0;
+        changed = true;
+      }
+
+      if (purchase.status === 'completed') continue;
+
+      const user = db.data.users.find(
+        u => String(u.telegram_id) === String(purchase.telegram_id)
+      );
+
+      if (!user) continue;
+
+      const dailyEarning = Number(purchase.daily_earning || 0);
+
+      if (dailyEarning <= 0) continue;
+
+      let nextMiningMs = new Date(purchase.next_mining_at).getTime();
+
+      if (!Number.isFinite(nextMiningMs)) {
+        nextMiningMs =
+          purchasedMs +
+          (Number(purchase.mined_cycles || 0) + 1) *
+            24 * 60 * 60 * 1000;
+
+        purchase.next_mining_at = new Date(nextMiningMs).toISOString();
+        changed = true;
+      }
+
+      let cyclesDue = 0;
+
+      while (
+        nowMs >= nextMiningMs &&
+        Number(purchase.mined_cycles || 0) < durationDays
+      ) {
+        cyclesDue++;
+
+        purchase.mined_cycles =
+          Number(purchase.mined_cycles || 0) + 1;
+
+        purchase.total_mined = Number(
+          (Number(purchase.total_mined || 0) + dailyEarning).toFixed(8)
+        );
+
+        user.balance = Number(
+          (Number(user.balance || 0) + dailyEarning).toFixed(8)
+        );
+
+        user.total_earned = Number(
+          (Number(user.total_earned || 0) + dailyEarning).toFixed(8)
+        );
+
+        user.updated_at = new Date().toISOString();
+
+        nextMiningMs += 24 * 60 * 60 * 1000;
+
+        purchase.next_mining_at =
+          new Date(nextMiningMs).toISOString();
+
+        changed = true;
+      }
+
+      if (
+        Number(purchase.mined_cycles || 0) >= durationDays
+      ) {
+        purchase.status = 'completed';
+        purchase.next_mining_at = null;
+        purchase.mining_completed_at =
+          new Date().toISOString();
+        changed = true;
+      }
+
+      if (cyclesDue > 0) {
+        purchase.last_mined_at =
+          new Date().toISOString();
+      }
+    }
+
+    if (changed) {
+      await db.write();
+    }
+  } catch (error) {
+    console.error('NFT mining settlement error:', error);
+  } finally {
+    miningSettlementRunning = false;
+  }
+}
+
+// User-specific mining state.
+// The backend settles due earnings before returning the timers.
+app.get('/api/nft/mining', requireTelegramUser, async (req, res) => {
+  try {
+    await settleNFTMining();
+    await db.read();
+
+    const telegramId = String(req.telegramUser.id);
+
+    db.data.nft_purchases ||= [];
+
+    const purchases = db.data.nft_purchases.filter(
+      p => String(p.telegram_id) === telegramId
+    );
+
+    const mining = purchases.map(p => {
+      const durationDays = Number(p.duration_days || 0);
+      const minedCycles = Number(p.mined_cycles || 0);
+
+      return {
+        id: p.id,
+        nft_id: p.nft_id,
+        nft_name: p.nft_name,
+        price: Number(p.price || 0),
+        daily_rate: Number(p.daily_rate || 0),
+        daily_earning: Number(
+          p.daily_earning || calculateNFTDailyEarning(p)
+        ),
+        duration_days: durationDays,
+        mined_cycles: minedCycles,
+        remaining_cycles: Math.max(
+          0,
+          durationDays - minedCycles
+        ),
+        purchased_at: p.purchased_at,
+        next_mining_at: p.next_mining_at || null,
+        last_mined_at: p.last_mined_at || null,
+        total_mined: Number(p.total_mined || 0),
+        status: p.status || 'active'
+      };
+    });
+
+    res.json({
+      success: true,
+      mining
+    });
+  } catch (error) {
+    console.error('NFT mining API error:', error);
+
+    res.status(500).json({
+      success: false,
+      message: 'Unable to load NFT mining'
+    });
+  }
+});
+
+// Automatic backend settlement.
+// This keeps mining progressing even when the Mini App is closed.
+settleNFTMining();
+
+setInterval(() => {
+  settleNFTMining();
+}, 60 * 1000);
+
+// ================= END NFT LIVE MINING ENGINE =================
+
+
 // NEXORA_ADMIN_V1_END
 
 app.listen(
@@ -1062,6 +1275,13 @@ app.post("/api/nft/purchase", requireTelegramUser, async (req, res) => {
       price: nft.price,
       duration_days: nft.duration_days,
       daily_rate: nft.daily_rate,
+      daily_earning: Number((nft.price * nft.daily_rate / 100).toFixed(8)),
+      mined_cycles: 0,
+      total_mined: 0,
+      next_mining_at: new Date(
+        Date.now() + 24 * 60 * 60 * 1000
+      ).toISOString(),
+      last_mined_at: null,
       referral_commission: referralCommission,
       commission_credited: referralCommission > 0,
       referrer_telegram_id: referrerTelegramId,
