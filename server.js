@@ -5,6 +5,8 @@ require("dotenv").config();
 
 const { db, initDatabase } = require("./database");
 const crypto = require("crypto");
+const { ethers } = require("ethers");
+const { pool } = require("./database");
 
 function verifyTelegramWebAppData(initData) {
   if (!initData || !process.env.BOT_TOKEN) return null;
@@ -78,21 +80,35 @@ function generateUniqueDepositAmount(requestedAmount, deposits) {
   throw new Error("No unique deposit amount available");
 }
 
-function requireTelegramUser(req, res, next) {
+async function requireTelegramUser(req, res, next) {
   const initData = req.headers["x-telegram-init-data"];
-
   const user = verifyTelegramWebAppData(initData);
 
   if (!user) {
-    return res.status(401).json({
-      success: false,
-      message: "Invalid Telegram authentication",
-    });
+    return res.status(401).json({ success: false, message: "Invalid Telegram authentication" });
+  }
+
+  try {
+    const r = await pool.query("SELECT banned FROM users WHERE telegram_id=$1", [String(user.id)]);
+    if (r.rows[0]?.banned) {
+      return res.status(403).json({ success: false, message: "Your Nexora AI account is suspended." });
+    }
+  } catch (e) {
+    console.error("Ban check failed:", e);
+    return res.status(503).json({ success: false, message: "Account security check unavailable" });
   }
 
   req.telegramUser = user;
   next();
 }
+
+function requireAdmin(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) return res.status(503).json({ success:false, message:"ADMIN_SECRET is not configured" });
+  if (req.headers["x-admin-secret"] !== secret) return res.status(401).json({ success:false, message:"Unauthorized" });
+  next();
+}
+
 
 app.get("/", (req, res) => {
   res.json({
@@ -301,86 +317,42 @@ app.post("/api/deposits", requireTelegramUser, async (req, res) => {
 // Admin verification.
 // Set ADMIN_SECRET in Render environment variables before using this route.
 
-app.post("/api/deposits/:id/verify", async (req, res) => {
-  try {
-    const adminSecret = process.env.ADMIN_SECRET;
-
-    if (!adminSecret) {
-      return res.status(503).json({
-        success: false,
-        message: "ADMIN_SECRET is not configured"
-      });
+app.post("/api/deposits/:id/verify", requireAdmin, async (req,res)=>{
+  try{
+    const txHash=String(req.body.tx_hash||"").trim();
+    if(!/^0x[a-fA-F0-9]{64}$/.test(txHash)){
+      return res.status(400).json({success:false,message:"A valid blockchain TX Hash is required"});
     }
+    const dres=await pool.query("SELECT * FROM deposits WHERE id=$1",[String(req.params.id)]);
+    if(!dres.rows.length)return res.status(404).json({success:false,message:"Deposit not found"});
+    const d=dres.rows[0];
+    if(!["pending","detected"].includes(d.status))return res.status(409).json({success:false,message:"Deposit has already been processed"});
 
-    if (req.headers["x-admin-secret"] !== adminSecret) {
-      return res.status(401).json({
-        success: false,
-        message: "Unauthorized"
-      });
+    const {provider}=await getUsdtContract();
+    const receipt=await provider.getTransactionReceipt(txHash);
+    if(!receipt)return res.status(400).json({success:false,message:"Transaction not found on BNB Smart Chain"});
+    const usdt=String(process.env.BSC_USDT_CONTRACT||"0x55d398326f99059fF775485246999027B3197955").toLowerCase();
+    const depositAddress=String(d.deposit_address||process.env.DEPOSIT_WALLET_ADDRESS||"").toLowerCase();
+    const topic=ethers.id("Transfer(address,address,uint256)");
+    let matched=false;
+    let blockNumber=receipt.blockNumber;
+    for(const log of receipt.logs||[]){
+      if(String(log.address).toLowerCase()!==usdt || log.topics?.[0]!==topic)continue;
+      const to="0x"+String(log.topics[2]).slice(-40);
+      const amount=Number(ethers.formatUnits(BigInt(log.data),18));
+      if(to.toLowerCase()===depositAddress && Math.abs(amount-Number(d.amount))<1e-9){matched=true;break;}
     }
-
-    await db.read();
-
-    const deposit = db.data.deposits.find(
-      d => String(d.id) === String(req.params.id)
-    );
-
-    if (!deposit) {
-      return res.status(404).json({
-        success: false,
-        message: "Deposit not found"
-      });
-    }
-
-    if (deposit.status !== "pending") {
-      return res.status(409).json({
-        success: false,
-        message: "Deposit has already been processed"
-      });
-    }
-
-    const user = db.data.users.find(
-      u => String(u.telegram_id) === String(deposit.telegram_id)
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "Deposit user not found"
-      });
-    }
-
-    // Credit the user's verified deposit.
-    user.balance = Number(user.balance || 0) + Number(deposit.amount);
-
-    const commission = 0;
-
-deposit.status = "verified";
-deposit.referral_commission = 0;
-deposit.commission_credited = false;
-    deposit.verified_at = new Date().toISOString();
-
-    user.updated_at = new Date().toISOString();
-
-    await db.write();
-
-    res.json({
-      success: true,
-      message: "Deposit verified successfully",
-      deposit,
-      user_balance: user.balance,
-      referral_commission: commission
-    });
-  } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to verify deposit"
-    });
-  }
+    if(!matched)return res.status(400).json({success:false,message:"TX Hash does not match this deposit's exact USDT amount and deposit address"});
+    const latest=await provider.getBlockNumber();
+    const confirmations=Math.max(0,latest-blockNumber+1);
+    const required=Number(process.env.DEPOSIT_CONFIRMATIONS||12);
+    if(confirmations<required)return res.status(400).json({success:false,message:`Transaction has only ${confirmations} confirmations; ${required} required`});
+    await creditVerifiedDeposit(d.id,txHash,blockNumber,confirmations);
+    await adminLog("deposit_manual_verified","deposit",d.id,{tx_hash:txHash,confirmations});
+    const fresh=await pool.query("SELECT * FROM deposits WHERE id=$1",[d.id]);
+    res.json({success:true,message:"Deposit verified from blockchain TX Hash",deposit:fresh.rows[0]});
+  }catch(e){console.error(e);res.status(500).json({success:false,message:"Failed to verify deposit",error:e.message});}
 });
-
 
 // ==================== FRONTEND API ROUTES ====================
 
@@ -605,9 +577,97 @@ app.get("/api/withdrawals", requireTelegramUser, async (req, res) => {
   }
 });
 
+
+// ==================== TELEGRAM SUPPORT BOT ====================
+async function telegramApi(method, body={}) {
+  const token=String(process.env.SUPPORT_BOT_TOKEN||"").trim();
+  if(!token) throw new Error("SUPPORT_BOT_TOKEN is not configured");
+  const r=await fetch(`https://api.telegram.org/bot${token}/${method}`,{
+    method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)
+  });
+  const data=await r.json();
+  if(!data.ok) throw new Error(data.description||"Telegram API error");
+  return data;
+}
+
+async function ensureSupportConversation(tgUser, chatId) {
+  const id=String(tgUser.id);
+  const r=await pool.query(
+    `INSERT INTO support_conversations(telegram_id,chat_id,username,first_name,last_name,status,updated_at,last_message_at)
+     VALUES($1,$2,$3,$4,$5,'open',NOW(),NOW())
+     ON CONFLICT(telegram_id) DO UPDATE SET chat_id=EXCLUDED.chat_id,
+       username=EXCLUDED.username,first_name=EXCLUDED.first_name,last_name=EXCLUDED.last_name,
+       updated_at=NOW()
+     RETURNING *`,
+    [id,String(chatId),tgUser.username||"",tgUser.first_name||"",tgUser.last_name||""]
+  );
+  return r.rows[0];
+}
+
+async function handleSupportBotUpdate(update) {
+  const msg=update?.message;
+  if(!msg?.chat?.id || !msg?.from) return;
+  const text=String(msg.text||"").trim();
+  if(!text) return;
+
+  const conv=await ensureSupportConversation(msg.from,msg.chat.id);
+  if(text.startsWith("/start")){
+    await telegramApi("sendMessage",{chat_id:msg.chat.id,text:
+      "👋 Welcome to Nexora AI Help Team.\n\nPlease send your query here. Our support team will review your message and reply to you here."});
+    return;
+  }
+
+  const ins=await pool.query(
+    `INSERT INTO support_messages(conversation_id,sender_type,sender_id,message_text,telegram_message_id)
+     VALUES($1,'user',$2,$3,$4) RETURNING id`,
+    [conv.id,String(msg.from.id),text,msg.message_id||null]
+  );
+  await pool.query(
+    `UPDATE support_conversations SET status='new',unread_count=unread_count+1,
+     updated_at=NOW(),last_message_at=NOW() WHERE id=$1`,[conv.id]
+  );
+  await telegramApi("sendMessage",{chat_id:msg.chat.id,text:
+    "✅ Your query has been received by Nexora AI Help Team. An admin will reply here."});
+}
+
+async function startSupportBotPolling(){
+  if(!process.env.SUPPORT_BOT_TOKEN){
+    console.warn("Support bot disabled: SUPPORT_BOT_TOKEN is not configured.");
+    return;
+  }
+  let offset=0;
+  try{ await telegramApi("deleteWebhook",{drop_pending_updates:false}); }catch(e){}
+  const loop=async()=>{
+    try{
+      const data=await telegramApi("getUpdates",{offset,timeout:25,allowed_updates:["message"]});
+      for(const u of (data.result||[])){
+        offset=Math.max(offset,Number(u.update_id)+1);
+        try{await handleSupportBotUpdate(u);}catch(e){console.error("Support update error:",e.message);}
+      }
+    }catch(e){console.error("Support bot polling error:",e.message);await new Promise(r=>setTimeout(r,3000));}
+    setImmediate(loop);
+  };
+  loop();
+}
+
+// Public config used by Mini App to open the separate support bot.
+app.get("/api/support/config",(req,res)=>{
+  const username=String(process.env.SUPPORT_BOT_USERNAME||"").replace(/^@/,"").trim();
+  if(!username)return res.status(503).json({success:false,message:"Support bot is not configured"});
+  res.json({success:true,bot_username:username,bot_url:`https://t.me/${username}`});
+});
+
 async function startServer() {
   try {
     await initDatabase();
+
+    setTimeout(() => {
+      monitorBep20Deposits();
+      finalizeDetectedDeposits();
+      setInterval(monitorBep20Deposits, Number(process.env.DEPOSIT_POLL_INTERVAL_MS || 15000));
+      setInterval(finalizeDetectedDeposits, Number(process.env.DEPOSIT_CONFIRMATION_POLL_MS || 30000));
+    }, 2000);
+    startSupportBotPolling();
 
     
 
@@ -801,121 +861,437 @@ app.get("/api/admin/nft-purchases", requireAdmin, async (req, res) => {
   }
 });
 
-// Process withdrawal
-app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req, res) => {
+// ==================== NEXORA AI ADMIN PRO ====================
+
+function adminLog(action, targetType="", targetId="", details={}) {
+  return pool.query(
+    `INSERT INTO admin_activity_logs (admin_action,target_type,target_id,details)
+     VALUES ($1,$2,$3,$4)`,
+    [action, targetType, String(targetId || ""), JSON.stringify(details || {})]
+  ).catch(e => console.error("Admin log error:", e));
+}
+
+function isValidBscAddress(address) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(address || "").trim());
+}
+
+async function getBscProvider() {
+  const rpc = String(process.env.BSC_RPC_URL || "").trim();
+  if (!rpc) throw new Error("BSC_RPC_URL is not configured");
+  const provider = new ethers.JsonRpcProvider(rpc, 56, { staticNetwork: true });
+  return provider;
+}
+
+const USDT_ABI = [
+  "function transfer(address to,uint256 amount) returns (bool)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)"
+];
+
+async function getUsdtContract() {
+  const provider = await getBscProvider();
+  const contractAddress = String(
+    process.env.BSC_USDT_CONTRACT || "0x55d398326f99059fF775485246999027B3197955"
+  ).trim();
+  return { provider, contract: new ethers.Contract(contractAddress, USDT_ABI, provider), contractAddress };
+}
+
+async function sendBep20Usdt(address, amount) {
+  if (!isValidBscAddress(address)) throw new Error("Invalid BEP-20 wallet address");
+  const key = String(process.env.WITHDRAWAL_PRIVATE_KEY || "").trim();
+  if (!key) throw new Error("Withdrawal sending wallet is not configured");
+
+  const { provider, contract } = await getUsdtContract();
+  const network = await provider.getNetwork();
+  if (Number(network.chainId) !== 56) throw new Error("Configured RPC is not BNB Smart Chain");
+
+  const wallet = new ethers.Wallet(key, provider);
+  const sender = await wallet.getAddress();
+  const decimals = Number(await contract.decimals());
+  const tokenAmount = ethers.parseUnits(Number(amount).toFixed(8), decimals);
+
+  const tokenBalance = await contract.balanceOf(sender);
+  if (tokenBalance < tokenAmount) throw new Error("Sending wallet has insufficient USDT");
+
+  const nativeBalance = await provider.getBalance(sender);
+  const gasEstimate = await contract.transfer.estimateGas(address, tokenAmount);
+  const feeData = await provider.getFeeData();
+  const gasPrice = feeData.gasPrice || 0n;
+  if (nativeBalance < gasEstimate * gasPrice) {
+    throw new Error("Sending wallet has insufficient BNB for gas");
+  }
+
+  const tx = await contract.connect(wallet).transfer(address, tokenAmount);
+  const receipt = await tx.wait(Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3));
+
+  return {
+    tx_hash: tx.hash,
+    block_number: receipt?.blockNumber || null,
+    confirmations: Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3)
+  };
+}
+
+async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmations) {
+  const client = await pool.connect();
   try {
-    await db.read();
+    await client.query("BEGIN");
+    const dep = await client.query(
+      "SELECT * FROM deposits WHERE id=$1 FOR UPDATE", [String(depositId)]
+    );
+    if (!dep.rows.length) throw new Error("Deposit not found");
+    const d = dep.rows[0];
+    if (d.status === "verified") {
+      await client.query("ROLLBACK");
+      return { already: true };
+    }
 
-    db.data.withdrawals ||= [];
-    db.data.users ||= [];
+    const usr = await client.query(
+      "SELECT * FROM users WHERE telegram_id=$1 FOR UPDATE", [String(d.telegram_id)]
+    );
+    if (!usr.rows.length) throw new Error("Deposit user not found");
+    const user = usr.rows[0];
 
-    const withdrawal = db.data.withdrawals.find(
-      w => String(w.id) === String(req.params.id)
+    const amount = Number(d.amount || 0);
+    const newBalance = Number(user.balance || 0) + amount;
+    let commission = 0;
+
+    if (!d.commission_credited && user.referred_by) {
+      const ref = await client.query(
+        "SELECT * FROM users WHERE LOWER(referral_code)=LOWER($1) AND telegram_id<>$2 FOR UPDATE",
+        [String(user.referred_by), String(user.telegram_id)]
+      );
+      if (ref.rows.length) {
+        commission = Number((amount * 0.05).toFixed(8));
+        await client.query(
+          "UPDATE users SET balance=balance+$1,total_earned=total_earned+$1,updated_at=NOW() WHERE telegram_id=$2",
+          [commission, String(ref.rows[0].telegram_id)]
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE users SET balance=$1, updated_at=NOW() WHERE telegram_id=$2`,
+      [newBalance, String(user.telegram_id)]
+    );
+    await client.query(
+      `UPDATE deposits SET status='verified', tx_hash=COALESCE($2,tx_hash),
+       block_number=COALESCE($3,block_number), confirmations=$4,
+       referral_commission=$5, commission_credited=$6, verified_at=NOW()
+       WHERE id=$1`,
+      [String(depositId), txHash || null, blockNumber || null, Number(confirmations || 0),
+       commission, commission > 0 || Boolean(d.commission_credited)]
     );
 
-    if (!withdrawal) {
-      return res.status(404).json({
-        success: false,
-        message: "Withdrawal not found"
-      });
+    await client.query("COMMIT");
+    return { already: false, commission };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function monitorBep20Deposits() {
+  const rpc = String(process.env.BSC_RPC_URL || "").trim();
+  const depositAddress = String(process.env.DEPOSIT_WALLET_ADDRESS || "").trim();
+  if (!rpc || !isValidBscAddress(depositAddress)) {
+    console.warn("BEP-20 deposit monitor disabled: configure BSC_RPC_URL and DEPOSIT_WALLET_ADDRESS.");
+    return;
+  }
+
+  try {
+    const provider = await getBscProvider();
+    const usdt = String(process.env.BSC_USDT_CONTRACT || "0x55d398326f99059fF775485246999027B3197955").toLowerCase();
+    const topic = ethers.id("Transfer(address,address,uint256)");
+    const latest = await provider.getBlockNumber();
+    const confRequired = Number(process.env.DEPOSIT_CONFIRMATIONS || 12);
+
+    const state = await pool.query("SELECT value FROM blockchain_scans WHERE key='deposit_last_block'");
+    let fromBlock = Number(state.rows[0]?.value || 0);
+    if (!fromBlock) fromBlock = Math.max(0, latest - Number(process.env.DEPOSIT_SCAN_LOOKBACK_BLOCKS || 5000));
+
+    const toBlock = Math.max(fromBlock, latest);
+    if (toBlock < fromBlock) return;
+
+    const logs = await provider.getLogs({
+      address: usdt,
+      topics: [topic, null, ethers.zeroPadValue(depositAddress, 32)],
+      fromBlock,
+      toBlock
+    });
+
+    for (const log of logs) {
+      const txHash = log.transactionHash;
+      const already = await pool.query("SELECT id FROM deposits WHERE tx_hash=$1 LIMIT 1", [txHash]);
+      if (already.rows.length) continue;
+
+      const amountRaw = BigInt(log.data);
+      const amount = Number(ethers.formatUnits(amountRaw, 18));
+      const matching = await pool.query(
+        `SELECT * FROM deposits
+         WHERE status IN ('pending','detected')
+           AND LOWER(deposit_address)=LOWER($1)
+           AND network='BEP-20' AND token='USDT'
+           AND ABS(amount-$2) < 0.000000001
+         ORDER BY created_at ASC LIMIT 1`,
+        [depositAddress, amount]
+      );
+
+      if (!matching.rows.length) {
+        const fromAddress = "0x" + String(log.topics?.[1] || "").slice(-40);
+        await pool.query(
+          `INSERT INTO unmatched_deposits(tx_hash,from_address,to_address,amount,block_number,reason)
+           VALUES($1,$2,$3,$4,$5,$6)
+           ON CONFLICT(tx_hash) DO NOTHING`,
+          [txHash,fromAddress,depositAddress,amount,log.blockNumber,"No pending deposit with exact unique amount"]
+        );
+        await adminLog("unmatched_deposit","blockchain",txHash,{amount,depositAddress,blockNumber:log.blockNumber});
+        continue;
+      }
+
+      const confirmations = Math.max(0, latest - log.blockNumber + 1);
+      const dep = matching.rows[0];
+
+      await pool.query(
+        `UPDATE deposits SET status='detected', tx_hash=$1, block_number=$2, confirmations=$3
+         WHERE id=$4 AND status IN ('pending','detected')`,
+        [txHash, log.blockNumber, confirmations, dep.id]
+      );
+
+      if (confirmations >= confRequired) {
+        await creditVerifiedDeposit(dep.id, txHash, log.blockNumber, confirmations);
+      }
     }
 
-    if (withdrawal.status !== "pending") {
-      return res.status(409).json({
-        success: false,
-        message: "Withdrawal already processed"
-      });
-    }
-
-    const user = db.data.users.find(
-      u => String(u.telegram_id) === String(withdrawal.telegram_id)
+    await pool.query(
+      `INSERT INTO blockchain_scans(key,value,updated_at) VALUES('deposit_last_block',$1,NOW())
+       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()`,
+      [String(toBlock)]
     );
+  } catch (e) {
+    console.error("BEP-20 deposit monitor error:", e.message);
+  }
+}
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+async function finalizeDetectedDeposits() {
+  try {
+    const { provider } = await getBscProvider();
+    const latest = await provider.getBlockNumber();
+    const required = Number(process.env.DEPOSIT_CONFIRMATIONS || 12);
+    const rows = await pool.query(
+      `SELECT * FROM deposits WHERE status='detected' AND tx_hash IS NOT NULL`
+    );
+    for (const d of rows.rows) {
+      if (d.block_number == null) continue;
+      const confirmations = Math.max(0, latest - Number(d.block_number) + 1);
+      await pool.query("UPDATE deposits SET confirmations=$1 WHERE id=$2", [confirmations, d.id]);
+      if (confirmations >= required) {
+        await creditVerifiedDeposit(d.id, d.tx_hash, d.block_number, confirmations);
+      }
     }
+  } catch (e) {
+    console.error("Deposit confirmation check error:", e.message);
+  }
+}
 
-    const amount = Number(withdrawal.amount || 0);
-    const balance = Number(user.balance || 0);
+// Enhanced admin dashboard
+app.get("/api/admin/statistics", requireAdmin, async (req,res)=>{
+  try {
+    await settleNFTMining();
+    const [u,d,w,n] = await Promise.all([
+      pool.query("SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE banned=false)::int active, COUNT(*) FILTER (WHERE banned=true)::int banned FROM users"),
+      pool.query("SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status='pending')::int pending, COUNT(*) FILTER (WHERE status='verified')::int verified, COALESCE(SUM(amount) FILTER (WHERE status='verified'),0) total_verified FROM deposits"),
+      pool.query("SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status='pending')::int pending, COUNT(*) FILTER (WHERE status IN ('processed','completed'))::int completed, COALESCE(SUM(amount) FILTER (WHERE status IN ('processed','completed')),0) total_paid FROM withdrawals"),
+      pool.query("SELECT COUNT(*)::int total, COALESCE(SUM(price),0) total_sales, COALESCE(SUM(daily_earning) FILTER (WHERE status='active'),0) daily_active FROM nft_purchases")
+    ]);
+    res.json({success:true, users:u.rows[0], deposits:d.rows[0], withdrawals:w.rows[0], nft:n.rows[0]});
+  } catch(e) { console.error(e); res.status(500).json({success:false,message:"Failed to load statistics"}); }
+});
 
-    if (amount <= 0 || amount > balance) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid or insufficient balance"
-      });
-    }
+app.get("/api/admin/analytics", requireAdmin, async (req,res)=>{
+  try{
+    const r=await pool.query(`
+      WITH days AS (
+        SELECT generate_series(current_date-13,current_date,interval '1 day')::date AS day
+      )
+      SELECT to_char(day,'YYYY-MM-DD') day,
+        (SELECT COUNT(*) FROM users WHERE created_at::date=day)::int users,
+        (SELECT COUNT(*) FROM deposits WHERE created_at::date=day)::int deposits,
+        (SELECT COALESCE(SUM(amount),0) FROM deposits WHERE created_at::date=day AND status='verified') deposits_amount,
+        (SELECT COUNT(*) FROM withdrawals WHERE created_at::date=day)::int withdrawals,
+        (SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE created_at::date=day AND status='completed') withdrawals_amount,
+        (SELECT COUNT(*) FROM nft_purchases WHERE purchased_at::date=day)::int nft_purchases,
+        (SELECT COALESCE(SUM(price),0) FROM nft_purchases WHERE purchased_at::date=day) nft_sales
+      FROM days ORDER BY day
+    `);
+    res.json({success:true,days:r.rows});
+  }catch(e){console.error(e);res.status(500).json({success:false,message:"Failed to load analytics"});}
+});
 
-    user.balance = Number((balance - amount).toFixed(8));
-    user.updated_at = new Date().toISOString();
+app.get("/api/admin/earnings-forecast", requireAdmin, async (req,res)=>{
+  try {
+    await settleNFTMining();
+    const r=await pool.query(
+      `SELECT COALESCE(SUM(daily_earning * LEAST(duration_days-mined_cycles,1)),0) AS next_24h,
+              COUNT(*) FILTER (WHERE status='active' AND duration_days>mined_cycles)::int AS active_positions,
+              COALESCE(SUM(daily_earning * GREATEST(duration_days-mined_cycles,0)),0) AS remaining_total
+       FROM nft_purchases WHERE status='active'`
+    );
+    const w=await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS pending_withdrawals FROM withdrawals
+       WHERE status IN ('pending','processing')`
+    );
+    const b=await pool.query(`SELECT COALESCE(SUM(balance),0) AS user_balances FROM users WHERE banned=false`);
+    const f=r.rows[0], wd=w.rows[0], bal=b.rows[0];
+    res.json({success:true, forecast:{
+      next_24h:Number(f.next_24h||0), active_positions:Number(f.active_positions||0),
+      remaining_total:Number(f.remaining_total||0), pending_withdrawals:Number(wd.pending_withdrawals||0),
+      user_balances:Number(bal.user_balances||0),
+      liquidity_reference:Number((Number(f.next_24h||0)+Number(wd.pending_withdrawals||0)).toFixed(8))
+    }});
+  } catch(e){console.error(e);res.status(500).json({success:false,message:"Failed to calculate forecast"});}
+});
 
-    withdrawal.status = "processed";
-    withdrawal.processed_at = new Date().toISOString();
+app.get("/api/admin/deposits/auto-status", requireAdmin, async (req,res)=>{
+  const r=await pool.query(`SELECT id,telegram_id,amount,status,tx_hash,block_number,confirmations,created_at,verified_at
+    FROM deposits ORDER BY created_at DESC LIMIT 500`);
+  res.json({success:true,deposits:r.rows});
+});
 
-    await db.write();
+app.get("/api/admin/deposits/unmatched", requireAdmin, async (req,res)=>{
+  const r=await pool.query("SELECT * FROM unmatched_deposits WHERE resolved=false ORDER BY created_at DESC LIMIT 500");
+  res.json({success:true,deposits:r.rows});
+});
+app.post("/api/admin/deposits/unmatched/:id/resolve", requireAdmin, async (req,res)=>{
+  const r=await pool.query("UPDATE unmatched_deposits SET resolved=true,resolved_at=NOW() WHERE id=$1 AND resolved=false RETURNING *",[req.params.id]);
+  if(!r.rows.length)return res.status(404).json({success:false,message:"Unmatched deposit not found"});
+  await adminLog("unmatched_deposit_resolved","deposit",req.params.id,{});
+  res.json({success:true,deposit:r.rows[0]});
+});
 
-    res.json({
-      success: true,
-      message: "Withdrawal marked as processed",
-      withdrawal,
-      user_balance: user.balance
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to process withdrawal"
-    });
+app.post("/api/admin/users/:id/ban", requireAdmin, async (req,res)=>{
+  const id=String(req.params.id);
+  await pool.query("UPDATE users SET banned=true,banned_at=NOW(),ban_reason=$1,updated_at=NOW() WHERE telegram_id=$2",[String(req.body.reason||"Admin action"),id]);
+  await adminLog("ban_user","user",id,{reason:req.body.reason||"Admin action"});
+  res.json({success:true,message:"User banned"});
+});
+app.post("/api/admin/users/:id/unban", requireAdmin, async (req,res)=>{
+  const id=String(req.params.id);
+  await pool.query("UPDATE users SET banned=false,banned_at=NULL,ban_reason='',updated_at=NOW() WHERE telegram_id=$1",[id]);
+  await adminLog("unban_user","user",id,{});
+  res.json({success:true,message:"User unbanned"});
+});
+
+app.get("/api/admin/logs", requireAdmin, async (req,res)=>{
+  const r=await pool.query("SELECT * FROM admin_activity_logs ORDER BY created_at DESC LIMIT 500");
+  res.json({success:true,logs:r.rows});
+});
+
+app.get("/api/admin/settings", requireAdmin, async (req,res)=>{
+  const r=await pool.query("SELECT key,value,updated_at FROM admin_settings ORDER BY key");
+  res.json({success:true,settings:r.rows});
+});
+
+app.post("/api/admin/settings", requireAdmin, async (req,res)=>{
+  const entries=req.body && typeof req.body==="object"?req.body:{};
+  for(const [key,value] of Object.entries(entries)){
+    if(!/^[A-Za-z0-9_.-]{1,80}$/.test(key)) continue;
+    await pool.query(`INSERT INTO admin_settings(key,value,updated_at) VALUES($1,$2,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()`,[key,String(value)]);
+  }
+  await adminLog("update_settings","settings","",entries);
+  res.json({success:true});
+});
+
+// Support / Help Team admin API
+app.get("/api/admin/support/conversations", requireAdmin, async (req,res)=>{
+  const q=String(req.query.q||"").trim();
+  const params=[];
+  let where="";
+  if(q){ params.push(`%${q}%`); where="WHERE telegram_id ILIKE $1 OR username ILIKE $1 OR first_name ILIKE $1 OR last_name ILIKE $1"; }
+  const r=await pool.query(`SELECT * FROM support_conversations ${where} ORDER BY last_message_at DESC NULLS LAST,updated_at DESC LIMIT 300`,params);
+  res.json({success:true,conversations:r.rows});
+});
+
+app.get("/api/admin/support/:id/messages", requireAdmin, async (req,res)=>{
+  const r=await pool.query(`SELECT m.*,c.telegram_id,c.chat_id FROM support_messages m
+    JOIN support_conversations c ON c.id=m.conversation_id
+    WHERE c.id=$1 ORDER BY m.created_at ASC`,[req.params.id]);
+  await pool.query("UPDATE support_conversations SET unread_count=0,updated_at=NOW() WHERE id=$1",[req.params.id]);
+  res.json({success:true,messages:r.rows});
+});
+
+app.post("/api/admin/support/:id/reply", requireAdmin, async (req,res)=>{
+  const text=String(req.body.message||"").trim();
+  if(!text) return res.status(400).json({success:false,message:"Message required"});
+  const c=await pool.query("SELECT * FROM support_conversations WHERE id=$1",[req.params.id]);
+  if(!c.rows.length) return res.status(404).json({success:false,message:"Conversation not found"});
+  const chatId=c.rows[0].chat_id;
+  const sent=await telegramApi("sendMessage",{chat_id:chatId,text});
+  const msg=await pool.query(`INSERT INTO support_messages(conversation_id,sender_type,sender_id,message_text,telegram_message_id)
+    VALUES($1,'admin',$2,$3,$4) RETURNING *`,[req.params.id,"admin",text,sent.result?.message_id||null]);
+  await pool.query("UPDATE support_conversations SET status='replied',unread_count=0,updated_at=NOW(),last_message_at=NOW() WHERE id=$1",[req.params.id]);
+  await adminLog("support_reply","support",req.params.id,{message:text});
+  res.json({success:true,message:msg.rows[0]});
+});
+
+app.post("/api/admin/support/:id/status", requireAdmin, async (req,res)=>{
+  const status=String(req.body.status||"").toLowerCase();
+  if(!["new","open","replied","closed"].includes(status)) return res.status(400).json({success:false,message:"Invalid status"});
+  await pool.query("UPDATE support_conversations SET status=$1,updated_at=NOW() WHERE id=$2",[status,req.params.id]);
+  await adminLog("support_status","support",req.params.id,{status});
+  res.json({success:true,status});
+});
+
+// Replace old withdrawal process/reject behavior with blockchain send.
+app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req,res)=>{
+  const id=String(req.params.id);
+  const client=await pool.connect();
+  let withdrawal=null;
+  try{
+    await client.query("BEGIN");
+    const wr=await client.query("SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE",[id]);
+    if(!wr.rows.length){await client.query("ROLLBACK");return res.status(404).json({success:false,message:"Withdrawal not found"});}
+    withdrawal=wr.rows[0];
+    if(withdrawal.status!=="pending"){await client.query("ROLLBACK");return res.status(409).json({success:false,message:"Withdrawal already processed"});}
+    if(!isValidBscAddress(withdrawal.address)){await client.query("ROLLBACK");return res.status(400).json({success:false,message:"Invalid BEP-20 wallet address"});}
+    const ur=await client.query("SELECT * FROM users WHERE telegram_id=$1 FOR UPDATE",[String(withdrawal.telegram_id)]);
+    if(!ur.rows.length){await client.query("ROLLBACK");return res.status(404).json({success:false,message:"User not found"});}
+    const amount=Number(withdrawal.amount||0), balance=Number(ur.rows[0].balance||0);
+    if(amount<=0||amount>balance){await client.query("ROLLBACK");return res.status(400).json({success:false,message:"Insufficient balance"});}
+    await client.query("UPDATE users SET balance=balance-$1,updated_at=NOW() WHERE telegram_id=$2",[amount,String(withdrawal.telegram_id)]);
+    await client.query("UPDATE withdrawals SET status='processing',error_message=NULL WHERE id=$1",[id]);
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK");throw e;}finally{client.release();}
+
+  try{
+    const sent=await sendBep20Usdt(withdrawal.address,Number(withdrawal.amount));
+    await pool.query(`UPDATE withdrawals SET status='completed',tx_hash=$1,block_number=$2,processed_at=NOW(),error_message=NULL WHERE id=$3`,
+      [sent.tx_hash,sent.block_number,id]);
+    await adminLog("withdrawal_completed","withdrawal",id,{tx_hash:sent.tx_hash,amount:Number(withdrawal.amount),address:withdrawal.address});
+    return res.json({success:true,message:"Withdrawal approved and sent on BEP-20",tx_hash:sent.tx_hash,withdrawal:{...withdrawal,status:"completed",tx_hash:sent.tx_hash}});
+  }catch(e){
+    await pool.query("UPDATE users SET balance=balance+$1,updated_at=NOW() WHERE telegram_id=$2",[Number(withdrawal.amount),String(withdrawal.telegram_id)]);
+    await pool.query("UPDATE withdrawals SET status='failed',error_message=$1 WHERE id=$2",[String(e.message||e),id]);
+    await adminLog("withdrawal_failed","withdrawal",id,{error:String(e.message||e)});
+    return res.status(502).json({success:false,message:"Blockchain transfer failed. User balance was restored.",error:String(e.message||e)});
   }
 });
 
-// Reject withdrawal
-app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => {
-  try {
-    await db.read();
-
-    db.data.withdrawals ||= [];
-
-    const withdrawal = db.data.withdrawals.find(
-      w => String(w.id) === String(req.params.id)
-    );
-
-    if (!withdrawal) {
-      return res.status(404).json({
-        success: false,
-        message: "Withdrawal not found"
-      });
-    }
-
-    if (withdrawal.status !== "pending") {
-      return res.status(409).json({
-        success: false,
-        message: "Withdrawal already processed"
-      });
-    }
-
-    withdrawal.status = "rejected";
-    withdrawal.rejected_at = new Date().toISOString();
-
-    await db.write();
-
-    res.json({
-      success: true,
-      message: "Withdrawal rejected",
-      withdrawal
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to reject withdrawal"
-    });
-  }
+app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req,res)=>{
+  const id=String(req.params.id);
+  const r=await pool.query("UPDATE withdrawals SET status='rejected',processed_at=NOW() WHERE id=$1 AND status='pending' RETURNING *",[id]);
+  if(!r.rows.length)return res.status(409).json({success:false,message:"Withdrawal not found or already processed"});
+  await adminLog("withdrawal_rejected","withdrawal",id,{});
+  res.json({success:true,message:"Withdrawal rejected",withdrawal:r.rows[0]});
 });
 
-
+// Admin support/bot status
+app.get("/api/admin/support/status", requireAdmin, async (req,res)=>{
+  const c=await pool.query("SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status IN ('new','open'))::int open, COALESCE(SUM(unread_count),0)::int unread FROM support_conversations");
+  res.json({success:true,status:c.rows[0]});
+});
 
 // ================= NFT LIVE MINING ENGINE =================
 
