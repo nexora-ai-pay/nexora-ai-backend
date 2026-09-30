@@ -646,7 +646,7 @@ async function broadcastMainBot(text) {
   } catch(e){ console.error("Main bot broadcast error:",e.message); }
 }
 
-async function formatNotificationDate(date) {
+function formatNotificationDate(date) {
   return new Intl.DateTimeFormat('en-IN', {
     day: '2-digit',
     month: 'short',
