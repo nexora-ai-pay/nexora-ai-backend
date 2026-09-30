@@ -298,6 +298,8 @@ app.post("/api/deposits", requireTelegramUser, async (req, res) => {
     db.data.deposits.push(deposit);
     await db.write();
 
+    void broadcastMainBot(`💰 Nexora AI — New Deposit Request\n\n👤 ${[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId}\n💵 Requested: ${amount.toFixed(4)} USDT\n🔢 Unique Amount: ${uniqueAmount.toFixed(6)} USDT\n🟢 Status: Pending verification`);
+
     res.json({
       success: true,
       message: "Deposit request created and is pending verification",
@@ -394,54 +396,73 @@ app.get("/api/referral", requireTelegramUser, async (req, res) => {
     await db.read();
 
     const telegramId = String(req.telegramUser.id);
-
-    const user = db.data.users.find(
-      u => String(u.telegram_id) === telegramId
-    );
+    const user = db.data.users.find(u => String(u.telegram_id) === telegramId);
 
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+      return res.status(404).json({ success: false, message: "User not found" });
     }
 
     const referralCode = String(user.referral_code || "");
+    const botUsername = String(process.env.MAIN_BOT_USERNAME || "NexoraAI_Pay_bot").replace(/^@/, "").trim();
 
-    const referredUsers = db.data.users.filter(
-      u =>
-        String(u.referred_by || "").trim().toLowerCase() ===
-        referralCode.trim().toLowerCase()
-    );
+    const referredUsers = db.data.users
+      .filter(u => String(u.referred_by || "").trim().toLowerCase() === referralCode.trim().toLowerCase())
+      .map(u => ({
+        telegram_id: String(u.telegram_id),
+        username: u.username || "",
+        first_name: u.first_name || "",
+        last_name: u.last_name || "",
+        created_at: u.created_at || null,
+        status: u.banned ? "BANNED" : "ACTIVE"
+      }))
+      .sort((a,b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 
     db.data.nft_purchases ||= [];
 
-    const nftReferralCommissions = db.data.nft_purchases.filter(
-      p =>
-        String(p.referrer_telegram_id || "") === telegramId &&
-        p.commission_credited === true
-    );
+    const nftActivity = db.data.nft_purchases
+      .filter(p => String(p.referrer_telegram_id || "") === telegramId && Number(p.referral_commission || 0) > 0)
+      .map(p => ({
+        type: "NFT Commission",
+        action: `5% commission • ${p.nft_name || "NFT"}`,
+        amount: Number(p.referral_commission || 0),
+        nft_name: p.nft_name || "NFT",
+        created_at: p.purchased_at || null,
+        telegram_id: String(p.telegram_id || "")
+      }));
 
-    const totalCommission = nftReferralCommissions.reduce(
-      (sum, p) => sum + Number(p.referral_commission || 0),
-      0
-    );
+    const depositActivity = db.data.deposits
+      .filter(d => {
+        const referred = db.data.users.find(u => String(u.telegram_id) === String(d.telegram_id));
+        return referred && String(referred.referred_by || "").trim().toLowerCase() === referralCode.trim().toLowerCase() && Number(d.referral_commission || 0) > 0;
+      })
+      .map(d => ({
+        type: "Deposit Commission",
+        action: "5% deposit commission",
+        amount: Number(d.referral_commission || 0),
+        created_at: d.verified_at || d.created_at || null,
+        telegram_id: String(d.telegram_id || "")
+      }));
+
+    const activity = [...nftActivity, ...depositActivity]
+      .sort((a,b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
+    const totalCommission = activity.reduce((sum, x) => sum + Number(x.amount || 0), 0);
 
     res.json({
       success: true,
       referral_code: referralCode,
+      referral_link: botUsername ? `https://t.me/${botUsername}?startapp=${encodeURIComponent(referralCode)}` : "",
       referral_count: referredUsers.length,
-      total_commission: Number(totalCommission.toFixed(8))
+      total_commission: Number(totalCommission.toFixed(8)),
+      total_earned: Number(totalCommission.toFixed(8)),
+      referrals: referredUsers,
+      activity: activity.slice(0, 50)
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load referral data"
-    });
+    res.status(500).json({ success: false, message: "Failed to load referral data" });
   }
 });
-
 
 // Deposit history for the authenticated user.
 app.get("/api/deposits", requireTelegramUser, async (req, res) => {
@@ -534,6 +555,10 @@ app.post("/api/withdrawals", requireTelegramUser, async (req, res) => {
 
     await db.write();
 
+    const wdName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
+    void sendPayoutReviewMessage(`💸 NEXORA AI PAYOUT REVIEW\n\n🆕 New Withdrawal Request\n👤 ${wdName}\n🆔 ${telegramId}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 Network: BEP-20\n🏦 Wallet: ${address}\n🕒 ${new Date().toISOString()}\n\nAdmin action required: Approve & Send / Reject`);
+    void broadcastMainBot(`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review`);
+
     res.json({
       success: true,
       message: "Withdrawal request submitted and marked pending",
@@ -577,6 +602,66 @@ app.get("/api/withdrawals", requireTelegramUser, async (req, res) => {
   }
 });
 
+
+// ==================== TELEGRAM ACTIVITY NOTIFICATIONS ====================
+async function botApiWithToken(token, method, body={}) {
+  const t=String(token||"").trim();
+  if(!t) throw new Error("Telegram bot token is not configured");
+  const r=await fetch(`https://api.telegram.org/bot${t}/${method}`,{
+    method:"POST",
+    headers:{"content-type":"application/json"},
+    body:JSON.stringify(body)
+  });
+  const data=await r.json();
+  if(!data.ok) {
+    const err=new Error(data.description||"Telegram API error");
+    err.telegram=data;
+    throw err;
+  }
+  return data;
+}
+
+async function sendMainBotMessage(chatId, text, extra={}) {
+  const token=String(process.env.BOT_TOKEN||"").trim();
+  if(!token) return {ok:false, skipped:true};
+  try { return await botApiWithToken(token,"sendMessage",{chat_id:String(chatId),text,disable_web_page_preview:true,...extra}); }
+  catch(e){ console.warn("Main bot sendMessage failed for",chatId,e.message); return {ok:false,error:e.message}; }
+}
+
+async function broadcastMainBot(text) {
+  const token=String(process.env.BOT_TOKEN||"").trim();
+  if(!token) { console.warn("Main bot broadcast disabled: BOT_TOKEN is not configured."); return; }
+  try {
+    await db.read();
+    const ids=[...new Set((db.data.users||[]).map(u=>String(u.telegram_id||"")).filter(Boolean))];
+    for(const id of ids){
+      const result=await sendMainBotMessage(id,text);
+      if(result?.telegram?.error_code===429){
+        const retry=Number(result.telegram.parameters?.retry_after||2);
+        await new Promise(r=>setTimeout(r,Math.min(retry,10)*1000));
+        await sendMainBotMessage(id,text);
+      }
+      await new Promise(r=>setTimeout(r,40));
+    }
+  } catch(e){ console.error("Main bot broadcast error:",e.message); }
+}
+
+async function sendPayoutReviewMessage(text) {
+  const token=String(process.env.PAYOUT_REVIEW_BOT_TOKEN||"").trim();
+  const chatId=String(process.env.PAYOUT_REVIEW_CHAT_ID||"").trim();
+  if(!token || !chatId){
+    console.warn("Payout Review notification disabled: configure PAYOUT_REVIEW_BOT_TOKEN and PAYOUT_REVIEW_CHAT_ID.");
+    return;
+  }
+  try { await botApiWithToken(token,"sendMessage",{chat_id:chatId,text,disable_web_page_preview:true}); }
+  catch(e){ console.error("Payout Review bot error:",e.message); }
+}
+
+app.get("/api/payout-review/config",(req,res)=>{
+  const username=String(process.env.PAYOUT_REVIEW_BOT_USERNAME||"").replace(/^@/,"").trim();
+  if(!username) return res.status(503).json({success:false,message:"Payout Review bot is not configured"});
+  res.json({success:true,bot_username:username,bot_url:`https://t.me/${username}`});
+});
 
 // ==================== TELEGRAM SUPPORT BOT ====================
 async function telegramApi(method, body={}) {
@@ -983,6 +1068,15 @@ async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmatio
     );
 
     await client.query("COMMIT");
+
+    const depositName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || String(user.telegram_id);
+    void broadcastMainBot(`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited${commission>0?`\n🎁 Referral commission: ${commission.toFixed(4)} USDT`:""}`);
+    if (commission > 0) {
+      const refUser=await pool.query("SELECT telegram_id,first_name,last_name,username FROM users WHERE LOWER(referral_code)=LOWER($1) LIMIT 1",[String(user.referred_by||"")]);
+      const ref=refUser.rows[0];
+      if(ref) void sendMainBotMessage(ref.telegram_id,`🎁 Nexora AI — Referral Commission\n\nA referred user completed a verified deposit.\n💵 Commission credited: ${commission.toFixed(4)} USDT`);
+    }
+
     return { already: false, commission };
   } catch (e) {
     await client.query("ROLLBACK");
@@ -1270,11 +1364,17 @@ app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req,res)=>{
     await pool.query(`UPDATE withdrawals SET status='completed',tx_hash=$1,block_number=$2,processed_at=NOW(),error_message=NULL WHERE id=$3`,
       [sent.tx_hash,sent.block_number,id]);
     await adminLog("withdrawal_completed","withdrawal",id,{tx_hash:sent.tx_hash,amount:Number(withdrawal.amount),address:withdrawal.address});
+    const paidUser=await pool.query("SELECT first_name,last_name,username,telegram_id FROM users WHERE telegram_id=$1",[String(withdrawal.telegram_id)]);
+    const pu=paidUser.rows[0]||{};
+    const paidName=[pu.first_name,pu.last_name].filter(Boolean).join(" ") || pu.username || String(withdrawal.telegram_id);
+    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: ${sent.tx_hash}`);
+    void broadcastMainBot(`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}`);
     return res.json({success:true,message:"Withdrawal approved and sent on BEP-20",tx_hash:sent.tx_hash,withdrawal:{...withdrawal,status:"completed",tx_hash:sent.tx_hash}});
   }catch(e){
     await pool.query("UPDATE users SET balance=balance+$1,updated_at=NOW() WHERE telegram_id=$2",[Number(withdrawal.amount),String(withdrawal.telegram_id)]);
     await pool.query("UPDATE withdrawals SET status='failed',error_message=$1 WHERE id=$2",[String(e.message||e),id]);
     await adminLog("withdrawal_failed","withdrawal",id,{error:String(e.message||e)});
+    void sendPayoutReviewMessage(`❌ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Failed\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n⚠️ ${String(e.message||e)}\n\nUser balance was restored.`);
     return res.status(502).json({success:false,message:"Blockchain transfer failed. User balance was restored.",error:String(e.message||e)});
   }
 });
@@ -1284,6 +1384,8 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req,res)=>{
   const r=await pool.query("UPDATE withdrawals SET status='rejected',processed_at=NOW() WHERE id=$1 AND status='pending' RETURNING *",[id]);
   if(!r.rows.length)return res.status(409).json({success:false,message:"Withdrawal not found or already processed"});
   await adminLog("withdrawal_rejected","withdrawal",id,{});
+  void sendPayoutReviewMessage(`🚫 NEXORA AI PAYOUT REVIEW\n\nWithdrawal Rejected\n🆔 ${r.rows[0].telegram_id}\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT`);
+  void broadcastMainBot(`🚫 Nexora AI — Withdrawal Rejected\n\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT\n🔴 Status: Rejected`);
   res.json({success:true,message:"Withdrawal rejected",withdrawal:r.rows[0]});
 });
 
@@ -1668,6 +1770,12 @@ app.post("/api/nft/purchase", requireTelegramUser, async (req, res) => {
     db.data.nft_purchases.push(purchase);
 
     await db.write();
+
+    const nftBuyerName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
+    void broadcastMainBot(`🖼️ Nexora AI — NFT Purchase\n\n👤 ${nftBuyerName}\n💎 Plan: ${nft.name}\n💵 Price: ${Number(nft.price).toFixed(2)} USDT\n🟢 Status: Active${referralCommission>0?`\n🎁 Referral commission credited: ${referralCommission.toFixed(4)} USDT`:""}`);
+    if (referralCommission > 0 && referrerTelegramId) {
+      void sendMainBotMessage(referrerTelegramId,`🎁 Nexora AI — 5% Referral NFT Commission\n\nYour referred user purchased ${nft.name}.\n💵 Commission: ${referralCommission.toFixed(4)} USDT\n🟢 Commission credited to your balance.`);
+    }
 
     res.json({
       success: true,
