@@ -556,8 +556,8 @@ app.post("/api/withdrawals", requireTelegramUser, async (req, res) => {
     await db.write();
 
     const wdName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
-    void sendPayoutReviewMessage(`💸 NEXORA AI PAYOUT REVIEW\n\n🆕 New Withdrawal Request\n👤 ${wdName}\n🆔 ${telegramId}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 Network: BEP-20\n🏦 Wallet: ${address}\n🕒 ${new Date().toISOString()}\n\nAdmin action required: Approve & Send / Reject`);
-    void broadcastMainBot(`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review`);
+    void sendPayoutReviewMessage(`💸 NEXORA AI PAYOUT REVIEW\n\n🆕 New Withdrawal Request\n👤 ${wdName}\n🆔 ${telegramId}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 Network: BEP-20\n🏦 Wallet: ${address}\n🕒 ${formatNotificationDate(new Date())}\n\nAdmin action required: Approve & Send / Reject`);
+    void broadcastMainBot(`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review\n🕒 ${formatNotificationDate(new Date())}`);
 
     res.json({
       success: true,
@@ -644,6 +644,18 @@ async function broadcastMainBot(text) {
       await new Promise(r=>setTimeout(r,40));
     }
   } catch(e){ console.error("Main bot broadcast error:",e.message); }
+}
+
+async function formatNotificationDate(date) {
+  return new Intl.DateTimeFormat('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'Asia/Kolkata'
+  }).format(date);
 }
 
 async function sendPayoutReviewMessage(text) {
@@ -1367,8 +1379,8 @@ app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req,res)=>{
     const paidUser=await pool.query("SELECT first_name,last_name,username,telegram_id FROM users WHERE telegram_id=$1",[String(withdrawal.telegram_id)]);
     const pu=paidUser.rows[0]||{};
     const paidName=[pu.first_name,pu.last_name].filter(Boolean).join(" ") || pu.username || String(withdrawal.telegram_id);
-    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: ${sent.tx_hash}`);
-    void broadcastMainBot(`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}`);
+    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: ${sent.tx_hash}\n🕒 ${formatNotificationDate(new Date())}`);
+    void broadcastMainBot(`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}\n🕒 ${formatNotificationDate(new Date())}`);
     return res.json({success:true,message:"Withdrawal approved and sent on BEP-20",tx_hash:sent.tx_hash,withdrawal:{...withdrawal,status:"completed",tx_hash:sent.tx_hash}});
   }catch(e){
     await pool.query("UPDATE users SET balance=balance+$1,updated_at=NOW() WHERE telegram_id=$2",[Number(withdrawal.amount),String(withdrawal.telegram_id)]);
