@@ -707,6 +707,8 @@ async function registerMainBotUserAndSendApp(msg, referralCode="") {
   const telegramId = String(tgUser.id);
   let user = db.data.users.find(u => String(u.telegram_id) === telegramId);
   const cleanReferral = String(referralCode || "").trim();
+  let referralRegisteredNow = false;
+  let referrerForNotification = null;
 
   if (!user) {
     let referredBy = "";
@@ -716,6 +718,7 @@ async function registerMainBotUserAndSendApp(msg, referralCode="") {
       );
       if (referrer && String(referrer.telegram_id) !== telegramId) {
         referredBy = String(referrer.referral_code);
+        referrerForNotification = referrer;
       }
     }
 
@@ -732,6 +735,7 @@ async function registerMainBotUserAndSendApp(msg, referralCode="") {
       updated_at: new Date().toISOString()
     };
     db.data.users.push(user);
+    referralRegisteredNow = Boolean(referredBy && referrerForNotification);
   } else {
     user.username = tgUser.username || "";
     user.first_name = tgUser.first_name || "";
@@ -745,6 +749,8 @@ async function registerMainBotUserAndSendApp(msg, referralCode="") {
       );
       if (referrer && String(referrer.telegram_id) !== telegramId) {
         user.referred_by = String(referrer.referral_code);
+        referrerForNotification = referrer;
+        referralRegisteredNow = true;
       }
     }
 
@@ -752,6 +758,17 @@ async function registerMainBotUserAndSendApp(msg, referralCode="") {
   }
 
   await db.write();
+
+  if (referralRegisteredNow && referrerForNotification?.telegram_id) {
+    const referredName = [tgUser.first_name, tgUser.last_name]
+      .filter(Boolean)
+      .join(" ") || tgUser.username || telegramId;
+
+    await sendMainBotMessage(
+      referrerForNotification.telegram_id,
+      `🎉 New Referral Activity\n\n👤 ${referredName} joined Nexora AI using your referral link.\n🔗 Referral Code: ${referrerForNotification.referral_code}\n🕒 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true })}\n\nYour referral has been registered successfully.`
+    );
+  }
 
   const miniAppUrl = String(
     process.env.MINI_APP_URL || "https://nexora-ai-pay.github.io/nexora-ai-mini-app/"
