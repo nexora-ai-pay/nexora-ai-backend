@@ -1171,22 +1171,80 @@ app.get("/api/admin/statistics", requireAdmin, async (req,res)=>{
 
 app.get("/api/admin/analytics", requireAdmin, async (req,res)=>{
   try{
-    const r=await pool.query(`
-      WITH days AS (
-        SELECT generate_series(current_date-364,current_date,interval '1 day')::date AS day
+    const r = await pool.query(`
+      WITH date_series AS (
+        SELECT generate_series(
+          CURRENT_DATE - INTERVAL '364 days',
+          CURRENT_DATE,
+          INTERVAL '1 day'
+        )::date AS metric_date
+      ),
+      user_daily AS (
+        SELECT created_at::date AS metric_date,
+               COUNT(*)::int AS users
+        FROM users
+        WHERE created_at IS NOT NULL
+          AND created_at >= CURRENT_DATE - INTERVAL '364 days'
+        GROUP BY created_at::date
+      ),
+      deposit_daily AS (
+        SELECT created_at::date AS metric_date,
+               COUNT(*)::int AS deposits,
+               COALESCE(SUM(amount) FILTER (WHERE status='verified'),0) AS deposits_amount
+        FROM deposits
+        WHERE created_at IS NOT NULL
+          AND created_at >= CURRENT_DATE - INTERVAL '364 days'
+        GROUP BY created_at::date
+      ),
+      withdrawal_daily AS (
+        SELECT created_at::date AS metric_date,
+               COUNT(*)::int AS withdrawals,
+               COALESCE(
+                 SUM(amount) FILTER (WHERE status IN ('processed','completed')),
+                 0
+               ) AS withdrawals_amount
+        FROM withdrawals
+        WHERE created_at IS NOT NULL
+          AND created_at >= CURRENT_DATE - INTERVAL '364 days'
+        GROUP BY created_at::date
+      ),
+      nft_daily AS (
+        SELECT purchased_at::date AS metric_date,
+               COUNT(*)::int AS nft_purchases,
+               COALESCE(SUM(price),0) AS nft_sales
+        FROM nft_purchases
+        WHERE purchased_at IS NOT NULL
+          AND purchased_at >= CURRENT_DATE - INTERVAL '364 days'
+        GROUP BY purchased_at::date
       )
-      SELECT to_char(day,'YYYY-MM-DD') day,
-        (SELECT COUNT(*) FROM users WHERE created_at::date=day)::int users,
-        (SELECT COUNT(*) FROM deposits WHERE created_at::date=day)::int deposits,
-        (SELECT COALESCE(SUM(amount),0) FROM deposits WHERE created_at::date=day AND status='verified') deposits_amount,
-        (SELECT COUNT(*) FROM withdrawals WHERE created_at::date=day)::int withdrawals,
-        (SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE created_at::date=day AND status='completed') withdrawals_amount,
-        (SELECT COUNT(*) FROM nft_purchases WHERE purchased_at::date=day)::int nft_purchases,
-        (SELECT COALESCE(SUM(price),0) FROM nft_purchases WHERE purchased_at::date=day) nft_sales
-      FROM days ORDER BY day
+      SELECT
+        TO_CHAR(ds.metric_date, 'YYYY-MM-DD') AS day,
+        COALESCE(u.users,0)::int AS users,
+        COALESCE(d.deposits,0)::int AS deposits,
+        COALESCE(d.deposits_amount,0) AS deposits_amount,
+        COALESCE(w.withdrawals,0)::int AS withdrawals,
+        COALESCE(w.withdrawals_amount,0) AS withdrawals_amount,
+        COALESCE(n.nft_purchases,0)::int AS nft_purchases,
+        COALESCE(n.nft_sales,0) AS nft_sales
+      FROM date_series ds
+      LEFT JOIN user_daily u ON u.metric_date = ds.metric_date
+      LEFT JOIN deposit_daily d ON d.metric_date = ds.metric_date
+      LEFT JOIN withdrawal_daily w ON w.metric_date = ds.metric_date
+      LEFT JOIN nft_daily n ON n.metric_date = ds.metric_date
+      ORDER BY ds.metric_date ASC
     `);
-    res.json({success:true,days:r.rows});
-  }catch(e){console.error(e);res.status(500).json({success:false,message:"Failed to load analytics"});}
+
+    res.json({
+      success:true,
+      days:r.rows
+    });
+  }catch(e){
+    console.error("Admin analytics error:", e);
+    res.status(500).json({
+      success:false,
+      message:"Failed to load analytics"
+    });
+  }
 });
 
 app.get("/api/admin/earnings-forecast", requireAdmin, async (req,res)=>{
