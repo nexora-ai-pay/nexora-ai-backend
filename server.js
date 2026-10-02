@@ -231,7 +231,7 @@ await db.write();
 
 // ==================== DEPOSIT SYSTEM ====================
 // Deposit requests stay PENDING until securely verified.
-// Referral commission is earned only from NFT purchases.
+// Referral commission: 5% of verified deposit.
 app.get("/api/deposit-config", (req, res) => {
   const address = String(process.env.DEPOSIT_WALLET_ADDRESS || "").trim();
 
@@ -298,7 +298,7 @@ app.post("/api/deposits", requireTelegramUser, async (req, res) => {
     db.data.deposits.push(deposit);
     await db.write();
 
-    void sendMainBotMessage(telegramId,`💰 Nexora AI — New Deposit Request\n\n👤 ${[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId}\n💵 Requested: ${amount.toFixed(4)} USDT\n🔢 Unique Amount: ${uniqueAmount.toFixed(6)} USDT\n🟢 Status: Pending verification`);
+    void broadcastMainBot(`💰 Nexora AI — New Deposit Request\n\n👤 ${[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId}\n💵 Requested: ${amount.toFixed(4)} USDT\n🔢 Unique Amount: ${uniqueAmount.toFixed(6)} USDT\n🟢 Status: Pending verification`);
 
     res.json({
       success: true,
@@ -430,7 +430,20 @@ app.get("/api/referral", requireTelegramUser, async (req, res) => {
         telegram_id: String(p.telegram_id || "")
       }));
 
-    const activity = [...nftActivity]
+    const depositActivity = db.data.deposits
+      .filter(d => {
+        const referred = db.data.users.find(u => String(u.telegram_id) === String(d.telegram_id));
+        return referred && String(referred.referred_by || "").trim().toLowerCase() === referralCode.trim().toLowerCase() && Number(d.referral_commission || 0) > 0;
+      })
+      .map(d => ({
+        type: "Deposit Commission",
+        action: "5% deposit commission",
+        amount: Number(d.referral_commission || 0),
+        created_at: d.verified_at || d.created_at || null,
+        telegram_id: String(d.telegram_id || "")
+      }));
+
+    const activity = [...nftActivity, ...depositActivity]
       .sort((a,b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 
     const totalCommission = activity.reduce((sum, x) => sum + Number(x.amount || 0), 0);
@@ -438,7 +451,7 @@ app.get("/api/referral", requireTelegramUser, async (req, res) => {
     res.json({
       success: true,
       referral_code: referralCode,
-      referral_link: botUsername ? `https://t.me/${botUsername}?start=${encodeURIComponent(referralCode)}` : "",
+      referral_link: botUsername ? `https://t.me/${botUsername}?startapp=${encodeURIComponent(referralCode)}` : "",
       referral_count: referredUsers.length,
       total_commission: Number(totalCommission.toFixed(8)),
       total_earned: Number(totalCommission.toFixed(8)),
@@ -543,8 +556,8 @@ app.post("/api/withdrawals", requireTelegramUser, async (req, res) => {
     await db.write();
 
     const wdName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
-    void sendPayoutReviewMessage(`💸 NEXORA AI PAYOUT REVIEW\n\n🆕 New Withdrawal Request\n👤 ${wdName}\n🆔 ${telegramId}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 Network: BEP-20\n🏦 Wallet: ${address}\n🕒 ${formatNotificationDate(new Date())}\n\nAdmin action required: Approve & Send / Reject`);
-    void sendMainBotMessage(telegramId,`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review\n🕒 ${formatNotificationDate(new Date())}`);
+    void sendPayoutReviewMessage(`💸 NEXORA AI PAYOUT REVIEW\n\n🆕 New Withdrawal Request\n👤 ${wdName}\n🆔 ${telegramId}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 Network: BEP-20\n🏦 Wallet: ${address}\n🕒 ${new Date().toISOString()}\n\nAdmin action required: Approve & Send / Reject`);
+    void broadcastMainBot(`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review`);
 
     res.json({
       success: true,
@@ -615,16 +628,22 @@ async function sendMainBotMessage(chatId, text, extra={}) {
   catch(e){ console.warn("Main bot sendMessage failed for",chatId,e.message); return {ok:false,error:e.message}; }
 }
 
-function formatNotificationDate(date) {
-  return new Intl.DateTimeFormat('en-IN', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-    timeZone: 'Asia/Kolkata'
-  }).format(date);
+async function broadcastMainBot(text) {
+  const token=String(process.env.BOT_TOKEN||"").trim();
+  if(!token) { console.warn("Main bot broadcast disabled: BOT_TOKEN is not configured."); return; }
+  try {
+    await db.read();
+    const ids=[...new Set((db.data.users||[]).map(u=>String(u.telegram_id||"")).filter(Boolean))];
+    for(const id of ids){
+      const result=await sendMainBotMessage(id,text);
+      if(result?.telegram?.error_code===429){
+        const retry=Number(result.telegram.parameters?.retry_after||2);
+        await new Promise(r=>setTimeout(r,Math.min(retry,10)*1000));
+        await sendMainBotMessage(id,text);
+      }
+      await new Promise(r=>setTimeout(r,40));
+    }
+  } catch(e){ console.error("Main bot broadcast error:",e.message); }
 }
 
 async function sendPayoutReviewMessage(text) {
@@ -696,156 +715,6 @@ async function handleSupportBotUpdate(update) {
     "✅ Your query has been received by Nexora AI Help Team. An admin will reply here."});
 }
 
-async function registerMainBotUserAndSendApp(msg, referralCode="") {
-  const tgUser = msg?.from;
-  const chatId = msg?.chat?.id;
-  if (!tgUser || !chatId) return;
-
-  await db.read();
-  db.data.users ||= [];
-
-  const telegramId = String(tgUser.id);
-  let user = db.data.users.find(u => String(u.telegram_id) === telegramId);
-  const cleanReferral = String(referralCode || "").trim();
-  let referralRegisteredNow = false;
-  let referrerForNotification = null;
-
-  if (!user) {
-    let referredBy = "";
-    if (cleanReferral) {
-      const referrer = db.data.users.find(
-        u => String(u.referral_code || "").trim().toLowerCase() === cleanReferral.toLowerCase()
-      );
-      if (referrer && String(referrer.telegram_id) !== telegramId) {
-        referredBy = String(referrer.referral_code);
-        referrerForNotification = referrer;
-      }
-    }
-
-    user = {
-      telegram_id: telegramId,
-      username: tgUser.username || "",
-      first_name: tgUser.first_name || "",
-      last_name: tgUser.last_name || "",
-      balance: 0,
-      total_earned: 0,
-      referral_code: `NX${telegramId}`,
-      referred_by: referredBy,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
-    db.data.users.push(user);
-    referralRegisteredNow = Boolean(referredBy && referrerForNotification);
-  } else {
-    user.username = tgUser.username || "";
-    user.first_name = tgUser.first_name || "";
-    user.last_name = tgUser.last_name || "";
-
-    if (!user.referral_code) user.referral_code = `NX${telegramId}`;
-
-    if (!user.referred_by && cleanReferral) {
-      const referrer = db.data.users.find(
-        u => String(u.referral_code || "").trim().toLowerCase() === cleanReferral.toLowerCase()
-      );
-      if (referrer && String(referrer.telegram_id) !== telegramId) {
-        user.referred_by = String(referrer.referral_code);
-        referrerForNotification = referrer;
-        referralRegisteredNow = true;
-      }
-    }
-
-    user.updated_at = new Date().toISOString();
-  }
-
-  await db.write();
-
-  if (referralRegisteredNow && referrerForNotification?.telegram_id) {
-    const referredName = [tgUser.first_name, tgUser.last_name]
-      .filter(Boolean)
-      .join(" ") || tgUser.username || telegramId;
-
-    await sendMainBotMessage(
-      referrerForNotification.telegram_id,
-      `🎉 New Referral Activity\n\n👤 ${referredName} joined Nexora AI using your referral link.\n🔗 Referral Code: ${referrerForNotification.referral_code}\n🕒 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true })}\n\nYour referral has been registered successfully.`
-    );
-  }
-
-  const miniAppUrl = String(
-    process.env.MINI_APP_URL || "https://nexora-ai-pay.github.io/nexora-ai-mini-app/"
-  ).trim();
-
-  await botApiWithToken(process.env.BOT_TOKEN, "sendMessage", {
-    chat_id: String(chatId),
-    text: cleanReferral
-      ? "👋 Welcome to Nexora AI. Your referral has been registered successfully.\n\n🚀 Open the Mini App below to continue."
-      : "👋 Welcome to Nexora AI.\n\n🚀 Open the Mini App below to continue.",
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "🚀 Open Nexora AI", web_app: { url: miniAppUrl } }
-      ]]
-    }
-  });
-}
-
-async function handleMainBotUpdate(update) {
-  const msg = update?.message;
-  if (!msg?.chat?.id || !msg?.from) return;
-
-  const text = String(msg.text || "").trim();
-  if (!text) return;
-
-  const match = text.match(/^\/start(?:@\S+)?(?:\s+(.+))?$/i);
-  if (!match) return;
-
-  try {
-    await registerMainBotUserAndSendApp(msg, match[1] || "");
-  } catch (e) {
-    console.error("Main bot update error:", e.message);
-    await sendMainBotMessage(
-      msg.chat.id,
-      "⚠️ Nexora AI is temporarily unable to open the Mini App. Please try /start again."
-    );
-  }
-}
-
-async function startMainBotPolling() {
-  if (!process.env.BOT_TOKEN) {
-    console.warn("Main bot disabled: BOT_TOKEN is not configured.");
-    return;
-  }
-
-  let offset = 0;
-  try {
-    await botApiWithToken(process.env.BOT_TOKEN, "deleteWebhook", { drop_pending_updates: false });
-  } catch (e) {}
-
-  const loop = async () => {
-    try {
-      const data = await botApiWithToken(process.env.BOT_TOKEN, "getUpdates", {
-        offset,
-        timeout: 25,
-        allowed_updates: ["message"]
-      });
-
-      for (const u of (data.result || [])) {
-        offset = Math.max(offset, Number(u.update_id) + 1);
-        try {
-          await handleMainBotUpdate(u);
-        } catch (e) {
-          console.error("Main bot update handling error:", e.message);
-        }
-      }
-    } catch (e) {
-      console.error("Main bot polling error:", e.message);
-      await new Promise(r => setTimeout(r, 3000));
-    }
-
-    setImmediate(loop);
-  };
-
-  loop();
-}
-
 async function startSupportBotPolling(){
   if(!process.env.SUPPORT_BOT_TOKEN){
     console.warn("Support bot disabled: SUPPORT_BOT_TOKEN is not configured.");
@@ -883,7 +752,6 @@ async function startServer() {
       setInterval(monitorBep20Deposits, Number(process.env.DEPOSIT_POLL_INTERVAL_MS || 15000));
       setInterval(finalizeDetectedDeposits, Number(process.env.DEPOSIT_CONFIRMATION_POLL_MS || 30000));
     }, 2000);
-    startMainBotPolling();
     startSupportBotPolling();
 
     
@@ -1170,6 +1038,22 @@ async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmatio
 
     const amount = Number(d.amount || 0);
     const newBalance = Number(user.balance || 0) + amount;
+    let commission = 0;
+
+    if (!d.commission_credited && user.referred_by) {
+      const ref = await client.query(
+        "SELECT * FROM users WHERE LOWER(referral_code)=LOWER($1) AND telegram_id<>$2 FOR UPDATE",
+        [String(user.referred_by), String(user.telegram_id)]
+      );
+      if (ref.rows.length) {
+        commission = Number((amount * 0.05).toFixed(8));
+        await client.query(
+          "UPDATE users SET balance=balance+$1,total_earned=total_earned+$1,updated_at=NOW() WHERE telegram_id=$2",
+          [commission, String(ref.rows[0].telegram_id)]
+        );
+      }
+    }
+
     await client.query(
       `UPDATE users SET balance=$1, updated_at=NOW() WHERE telegram_id=$2`,
       [newBalance, String(user.telegram_id)]
@@ -1177,17 +1061,23 @@ async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmatio
     await client.query(
       `UPDATE deposits SET status='verified', tx_hash=COALESCE($2,tx_hash),
        block_number=COALESCE($3,block_number), confirmations=$4,
-       referral_commission=0, commission_credited=false, verified_at=NOW()
+       referral_commission=$5, commission_credited=$6, verified_at=NOW()
        WHERE id=$1`,
-      [String(depositId), txHash || null, blockNumber || null, Number(confirmations || 0)]
+      [String(depositId), txHash || null, blockNumber || null, Number(confirmations || 0),
+       commission, commission > 0 || Boolean(d.commission_credited)]
     );
 
     await client.query("COMMIT");
 
     const depositName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || String(user.telegram_id);
-    void sendMainBotMessage(user.telegram_id,`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited`);
+    void broadcastMainBot(`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited${commission>0?`\n🎁 Referral commission: ${commission.toFixed(4)} USDT`:""}`);
+    if (commission > 0) {
+      const refUser=await pool.query("SELECT telegram_id,first_name,last_name,username FROM users WHERE LOWER(referral_code)=LOWER($1) LIMIT 1",[String(user.referred_by||"")]);
+      const ref=refUser.rows[0];
+      if(ref) void sendMainBotMessage(ref.telegram_id,`🎁 Nexora AI — Referral Commission\n\nA referred user completed a verified deposit.\n💵 Commission credited: ${commission.toFixed(4)} USDT`);
+    }
 
-    return { already: false, commission: 0 };
+    return { already: false, commission };
   } catch (e) {
     await client.query("ROLLBACK");
     throw e;
@@ -1210,69 +1100,74 @@ async function monitorBep20Deposits() {
     const topic = ethers.id("Transfer(address,address,uint256)");
     const latest = await provider.getBlockNumber();
     const confRequired = Number(process.env.DEPOSIT_CONFIRMATIONS || 12);
+    const chunkSize = Math.max(50, Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS || 500));
 
     const state = await pool.query("SELECT value FROM blockchain_scans WHERE key='deposit_last_block'");
     let fromBlock = Number(state.rows[0]?.value || 0);
     if (!fromBlock) fromBlock = Math.max(0, latest - Number(process.env.DEPOSIT_SCAN_LOOKBACK_BLOCKS || 5000));
+    if (fromBlock > latest) fromBlock = latest;
 
-    const toBlock = Math.max(fromBlock, latest);
-    if (toBlock < fromBlock) return;
-
-    const logs = await provider.getLogs({
-      address: usdt,
-      topics: [topic, null, ethers.zeroPadValue(depositAddress, 32)],
-      fromBlock,
-      toBlock
-    });
-
-    for (const log of logs) {
-      const txHash = log.transactionHash;
-      const already = await pool.query("SELECT id FROM deposits WHERE tx_hash=$1 LIMIT 1", [txHash]);
-      if (already.rows.length) continue;
-
-      const amountRaw = BigInt(log.data);
-      const amount = Number(ethers.formatUnits(amountRaw, 18));
-      const matching = await pool.query(
-        `SELECT * FROM deposits
-         WHERE status IN ('pending','detected')
-           AND LOWER(deposit_address)=LOWER($1)
-           AND network='BEP-20' AND token='USDT'
-           AND ABS(amount-$2) < 0.000000001
-         ORDER BY created_at ASC LIMIT 1`,
-        [depositAddress, amount]
-      );
-
-      if (!matching.rows.length) {
-        const fromAddress = "0x" + String(log.topics?.[1] || "").slice(-40);
-        await pool.query(
-          `INSERT INTO unmatched_deposits(tx_hash,from_address,to_address,amount,block_number,reason)
-           VALUES($1,$2,$3,$4,$5,$6)
-           ON CONFLICT(tx_hash) DO NOTHING`,
-          [txHash,fromAddress,depositAddress,amount,log.blockNumber,"No pending deposit with exact unique amount"]
-        );
-        await adminLog("unmatched_deposit","blockchain",txHash,{amount,depositAddress,blockNumber:log.blockNumber});
-        continue;
+    while (fromBlock <= latest) {
+      const toBlock = Math.min(latest, fromBlock + chunkSize - 1);
+      let logs;
+      try {
+        logs = await provider.getLogs({
+          address: usdt,
+          topics: [topic, null, ethers.zeroPadValue(depositAddress, 32)],
+          fromBlock,
+          toBlock
+        });
+      } catch (chunkError) {
+        console.error(`BEP-20 deposit monitor chunk error ${fromBlock}-${toBlock}:`, chunkError.message);
+        break;
       }
 
-      const confirmations = Math.max(0, latest - log.blockNumber + 1);
-      const dep = matching.rows[0];
+      for (const log of logs) {
+        const txHash = log.transactionHash;
+        const already = await pool.query("SELECT id FROM deposits WHERE tx_hash=$1 LIMIT 1", [txHash]);
+        if (already.rows.length) continue;
+
+        const amountRaw = BigInt(log.data);
+        const amount = Number(ethers.formatUnits(amountRaw, 18));
+        const matching = await pool.query(
+          `SELECT * FROM deposits
+           WHERE status IN ('pending','detected')
+             AND LOWER(deposit_address)=LOWER($1)
+             AND network='BEP-20' AND token='USDT'
+             AND ABS(amount-$2) < 0.000000001
+           ORDER BY created_at ASC LIMIT 1`,
+          [depositAddress, amount]
+        );
+
+        if (!matching.rows.length) {
+          const fromAddress = "0x" + String(log.topics?.[1] || "").slice(-40);
+          await pool.query(
+            `INSERT INTO unmatched_deposits(tx_hash,from_address,to_address,amount,block_number,reason)
+             VALUES($1,$2,$3,$4,$5,$6)
+             ON CONFLICT(tx_hash) DO NOTHING`,
+            [txHash,fromAddress,depositAddress,amount,log.blockNumber,"No pending deposit with exact unique amount"]
+          );
+          await adminLog("unmatched_deposit","blockchain",txHash,{amount,depositAddress,blockNumber:log.blockNumber});
+          continue;
+        }
+
+        const confirmations = Math.max(0, latest - log.blockNumber + 1);
+        const dep = matching.rows[0];
+        await pool.query(
+          `UPDATE deposits SET status='detected', tx_hash=$1, block_number=$2, confirmations=$3
+           WHERE id=$4 AND status IN ('pending','detected')`,
+          [txHash, log.blockNumber, confirmations, dep.id]
+        );
+        if (confirmations >= confRequired) await creditVerifiedDeposit(dep.id, txHash, log.blockNumber, confirmations);
+      }
 
       await pool.query(
-        `UPDATE deposits SET status='detected', tx_hash=$1, block_number=$2, confirmations=$3
-         WHERE id=$4 AND status IN ('pending','detected')`,
-        [txHash, log.blockNumber, confirmations, dep.id]
+        `INSERT INTO blockchain_scans(key,value,updated_at) VALUES('deposit_last_block',$1,NOW())
+         ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at`,
+        [String(toBlock)]
       );
-
-      if (confirmations >= confRequired) {
-        await creditVerifiedDeposit(dep.id, txHash, log.blockNumber, confirmations);
-      }
+      fromBlock = toBlock + 1;
     }
-
-    await pool.query(
-      `INSERT INTO blockchain_scans(key,value,updated_at) VALUES('deposit_last_block',$1,NOW())
-       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()`,
-      [String(toBlock)]
-    );
   } catch (e) {
     console.error("BEP-20 deposit monitor error:", e.message);
   }
@@ -1317,7 +1212,7 @@ app.get("/api/admin/analytics", requireAdmin, async (req,res)=>{
   try{
     const r=await pool.query(`
       WITH days AS (
-        SELECT generate_series(current_date-13,current_date,interval '1 day')::date AS day
+        SELECT generate_series(current_date-364,current_date,interval '1 day')::date AS day
       )
       SELECT to_char(day,'YYYY-MM-DD') day,
         (SELECT COUNT(*) FROM users WHERE created_at::date=day)::int users,
@@ -1390,6 +1285,24 @@ app.post("/api/admin/users/:id/unban", requireAdmin, async (req,res)=>{
 app.get("/api/admin/logs", requireAdmin, async (req,res)=>{
   const r=await pool.query("SELECT * FROM admin_activity_logs ORDER BY created_at DESC LIMIT 500");
   res.json({success:true,logs:r.rows});
+});
+
+app.get("/api/admin/system-config", requireAdmin, async (req,res)=>{
+  const rpc=String(process.env.BSC_RPC_URL||"").trim();
+  const depositAddress=String(process.env.DEPOSIT_WALLET_ADDRESS||"").trim();
+  const usdt=String(process.env.BSC_USDT_CONTRACT||"0x55d398326f99059fF775485246999027B3197955").trim();
+  res.json({success:true,config:{
+    chain:"BNB Smart Chain (BEP-20)",
+    auto_deposit_monitor:Boolean(rpc && isValidBscAddress(depositAddress)),
+    deposit_confirmations:Number(process.env.DEPOSIT_CONFIRMATIONS||12),
+    deposit_poll_interval_ms:Number(process.env.DEPOSIT_POLL_INTERVAL_MS||15000),
+    deposit_scan_chunk_blocks:Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS||500),
+    withdrawal_confirmations:Number(process.env.WITHDRAWAL_CONFIRMATIONS||3),
+    withdrawal_sender_configured:Boolean(String(process.env.WITHDRAWAL_PRIVATE_KEY||"").trim()),
+    usdt_contract:usdt,
+    deposit_address_configured:isValidBscAddress(depositAddress),
+    rpc_configured:Boolean(rpc)
+  }});
 });
 
 app.get("/api/admin/settings", requireAdmin, async (req,res)=>{
@@ -1477,8 +1390,8 @@ app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req,res)=>{
     const paidUser=await pool.query("SELECT first_name,last_name,username,telegram_id FROM users WHERE telegram_id=$1",[String(withdrawal.telegram_id)]);
     const pu=paidUser.rows[0]||{};
     const paidName=[pu.first_name,pu.last_name].filter(Boolean).join(" ") || pu.username || String(withdrawal.telegram_id);
-    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: ${sent.tx_hash}\n🕒 ${formatNotificationDate(new Date())}`);
-    void sendMainBotMessage(withdrawal.telegram_id,`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}\n🕒 ${formatNotificationDate(new Date())}`);
+    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: ${sent.tx_hash}`);
+    void broadcastMainBot(`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}`);
     return res.json({success:true,message:"Withdrawal approved and sent on BEP-20",tx_hash:sent.tx_hash,withdrawal:{...withdrawal,status:"completed",tx_hash:sent.tx_hash}});
   }catch(e){
     await pool.query("UPDATE users SET balance=balance+$1,updated_at=NOW() WHERE telegram_id=$2",[Number(withdrawal.amount),String(withdrawal.telegram_id)]);
@@ -1495,7 +1408,7 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req,res)=>{
   if(!r.rows.length)return res.status(409).json({success:false,message:"Withdrawal not found or already processed"});
   await adminLog("withdrawal_rejected","withdrawal",id,{});
   void sendPayoutReviewMessage(`🚫 NEXORA AI PAYOUT REVIEW\n\nWithdrawal Rejected\n🆔 ${r.rows[0].telegram_id}\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT`);
-  void sendMainBotMessage(r.rows[0].telegram_id,`🚫 Nexora AI — Withdrawal Rejected\n\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT\n🔴 Status: Rejected`);
+  void broadcastMainBot(`🚫 Nexora AI — Withdrawal Rejected\n\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT\n🔴 Status: Rejected`);
   res.json({success:true,message:"Withdrawal rejected",withdrawal:r.rows[0]});
 });
 
@@ -1882,7 +1795,7 @@ app.post("/api/nft/purchase", requireTelegramUser, async (req, res) => {
     await db.write();
 
     const nftBuyerName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
-    void sendMainBotMessage(telegramId,`🖼️ Nexora AI — NFT Purchase\n\n👤 ${nftBuyerName}\n💎 Plan: ${nft.name}\n💵 Price: ${Number(nft.price).toFixed(2)} USDT\n🟢 Status: Active`);
+    void broadcastMainBot(`🖼️ Nexora AI — NFT Purchase\n\n👤 ${nftBuyerName}\n💎 Plan: ${nft.name}\n💵 Price: ${Number(nft.price).toFixed(2)} USDT\n🟢 Status: Active${referralCommission>0?`\n🎁 Referral commission credited: ${referralCommission.toFixed(4)} USDT`:""}`);
     if (referralCommission > 0 && referrerTelegramId) {
       void sendMainBotMessage(referrerTelegramId,`🎁 Nexora AI — 5% Referral NFT Commission\n\nYour referred user purchased ${nft.name}.\n💵 Commission: ${referralCommission.toFixed(4)} USDT\n🟢 Commission credited to your balance.`);
     }
