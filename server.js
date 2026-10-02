@@ -778,171 +778,119 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Admin dashboard
+// Admin dashboard — PostgreSQL source of truth
 app.get("/api/admin/dashboard", requireAdmin, async (req, res) => {
   try {
-    await db.read();
+    const [u, d, w, n, totals] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS users,
+                         COUNT(*) FILTER (WHERE banned=false)::int AS active_users,
+                         COUNT(*) FILTER (WHERE banned=true)::int AS banned_users
+                  FROM users`),
+      pool.query(`SELECT COUNT(*) FILTER (WHERE status='pending')::int AS pending_deposits,
+                         COUNT(*) FILTER (WHERE status='verified')::int AS verified_deposits,
+                         COALESCE(SUM(amount) FILTER (WHERE status='verified'),0) AS total_deposits
+                  FROM deposits`),
+      pool.query(`SELECT COUNT(*) FILTER (WHERE status='pending')::int AS pending_withdrawals,
+                         COUNT(*) FILTER (WHERE status IN ('processed','completed'))::int AS processed_withdrawals,
+                         COALESCE(SUM(amount) FILTER (WHERE status IN ('processed','completed')),0) AS total_withdrawals
+                  FROM withdrawals`),
+      pool.query(`SELECT COUNT(*)::int AS nft_purchases,
+                         COALESCE(SUM(referral_commission),0) AS total_referral_commission
+                  FROM nft_purchases`),
+      pool.query(`SELECT COALESCE(SUM(balance),0) AS total_balance,
+                         COALESCE(SUM(total_earned),0) AS total_earned
+                  FROM users`)
+    ]);
 
-    db.data.users ||= [];
-    db.data.deposits ||= [];
-    db.data.withdrawals ||= [];
-    db.data.nft_purchases ||= [];
-
-    const verifiedDeposits = db.data.deposits.filter(
-      d => d.status === "verified"
-    );
-
-    const pendingDeposits = db.data.deposits.filter(
-      d => d.status === "pending"
-    );
-
-    const pendingWithdrawals = db.data.withdrawals.filter(
-      w => w.status === "pending"
-    );
-
-    const processedWithdrawals = db.data.withdrawals.filter(
-      w => w.status === "processed"
-    );
-
-    const totalBalance = db.data.users.reduce(
-      (s, u) => s + Number(u.balance || 0),
-      0
-    );
-
-    const totalEarned = db.data.users.reduce(
-      (s, u) => s + Number(u.total_earned || 0),
-      0
-    );
-
-    const totalDeposits = verifiedDeposits.reduce(
-      (s, d) => s + Number(d.amount || 0),
-      0
-    );
-
-    const totalWithdrawals = processedWithdrawals.reduce(
-      (s, w) => s + Number(w.amount || 0),
-      0
-    );
-
-    const totalCommission = db.data.nft_purchases.reduce(
-      (s, p) => s + Number(p.referral_commission || 0),
-      0
-    );
-
+    const a = u.rows[0], b = d.rows[0], c = w.rows[0], e = n.rows[0], t = totals.rows[0];
     res.json({
       success: true,
       stats: {
-        users: db.data.users.length,
-        pending_deposits: pendingDeposits.length,
-        verified_deposits: verifiedDeposits.length,
-        pending_withdrawals: pendingWithdrawals.length,
-        processed_withdrawals: processedWithdrawals.length,
-        nft_purchases: db.data.nft_purchases.length,
-        total_balance: Number(totalBalance.toFixed(8)),
-        total_earned: Number(totalEarned.toFixed(8)),
-        total_deposits: Number(totalDeposits.toFixed(8)),
-        total_withdrawals: Number(totalWithdrawals.toFixed(8)),
-        total_referral_commission: Number(totalCommission.toFixed(8))
+        users: Number(a.users || 0),
+        active_users: Number(a.active_users || 0),
+        banned_users: Number(a.banned_users || 0),
+        pending_deposits: Number(b.pending_deposits || 0),
+        verified_deposits: Number(b.verified_deposits || 0),
+        pending_withdrawals: Number(c.pending_withdrawals || 0),
+        processed_withdrawals: Number(c.processed_withdrawals || 0),
+        nft_purchases: Number(e.nft_purchases || 0),
+        total_balance: Number(t.total_balance || 0),
+        total_earned: Number(t.total_earned || 0),
+        total_deposits: Number(b.total_deposits || 0),
+        total_withdrawals: Number(c.total_withdrawals || 0),
+        total_referral_commission: Number(e.total_referral_commission || 0)
       }
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load admin dashboard"
-    });
+    console.error("Admin dashboard error:", error);
+    res.status(500).json({ success: false, message: "Failed to load admin dashboard" });
   }
 });
 
-// Admin users
+// Admin users — PostgreSQL source of truth
 app.get("/api/admin/users", requireAdmin, async (req, res) => {
   try {
-    await db.read();
-    db.data.users ||= [];
+    // Read the complete PostgreSQL row so the Admin Panel remains compatible
+    // with the currently deployed users schema.
+    const r = await pool.query(`
+      SELECT * FROM users
+      ORDER BY created_at DESC NULLS LAST
+    `);
 
-    res.json({
-      success: true,
-      count: db.data.users.length,
-      users: db.data.users
-    });
+    const users = r.rows.map(u => ({
+      ...u,
+      telegram_id: String(u.telegram_id ?? ""),
+      username: u.username ?? "",
+      first_name: u.first_name ?? "",
+      last_name: u.last_name ?? "",
+      balance: Number(u.balance ?? 0),
+      total_earned: Number(u.total_earned ?? 0),
+      referral_code: u.referral_code ?? `NX${u.telegram_id ?? ""}`,
+      referred_by: u.referred_by ?? "",
+      banned: Boolean(u.banned ?? false),
+      banned_at: u.banned_at ?? null,
+      ban_reason: u.ban_reason ?? "",
+      created_at: u.created_at ?? null,
+      updated_at: u.updated_at ?? null
+    }));
+
+    res.json({ success: true, count: users.length, users });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load users"
-    });
+    console.error("Admin users error:", error);
+    res.status(500).json({ success: false, message: "Failed to load users" });
   }
 });
 
-// Admin deposits
+// Admin deposits — PostgreSQL source of truth
 app.get("/api/admin/deposits", requireAdmin, async (req, res) => {
   try {
-    await db.read();
-    db.data.deposits ||= [];
-
-    const deposits = [...db.data.deposits].sort(
-      (a, b) =>
-        new Date(b.created_at || 0) -
-        new Date(a.created_at || 0)
-    );
-
-    res.json({
-      success: true,
-      count: deposits.length,
-      deposits
-    });
+    const r = await pool.query(`SELECT * FROM deposits ORDER BY created_at DESC NULLS LAST`);
+    res.json({ success: true, count: r.rows.length, deposits: r.rows });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load deposits"
-    });
+    console.error("Admin deposits error:", error);
+    res.status(500).json({ success: false, message: "Failed to load deposits" });
   }
 });
 
-// Admin withdrawals
+// Admin withdrawals — PostgreSQL source of truth
 app.get("/api/admin/withdrawals", requireAdmin, async (req, res) => {
   try {
-    await db.read();
-    db.data.withdrawals ||= [];
-
-    const withdrawals = [...db.data.withdrawals].sort(
-      (a, b) =>
-        new Date(b.created_at || 0) -
-        new Date(a.created_at || 0)
-    );
-
-    res.json({
-      success: true,
-      count: withdrawals.length,
-      withdrawals
-    });
+    const r = await pool.query(`SELECT * FROM withdrawals ORDER BY created_at DESC NULLS LAST`);
+    res.json({ success: true, count: r.rows.length, withdrawals: r.rows });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load withdrawals"
-    });
+    console.error("Admin withdrawals error:", error);
+    res.status(500).json({ success: false, message: "Failed to load withdrawals" });
   }
 });
 
-// Admin NFT purchases
+// Admin NFT purchases — PostgreSQL source of truth
 app.get("/api/admin/nft-purchases", requireAdmin, async (req, res) => {
   try {
-    await db.read();
-    db.data.nft_purchases ||= [];
-
-    res.json({
-      success: true,
-      count: db.data.nft_purchases.length,
-      purchases: db.data.nft_purchases
-    });
+    const r = await pool.query(`SELECT * FROM nft_purchases ORDER BY purchased_at DESC NULLS LAST`);
+    res.json({ success: true, count: r.rows.length, purchases: r.rows });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to load NFT purchases"
-    });
+    console.error("Admin NFT purchases error:", error);
+    res.status(500).json({ success: false, message: "Failed to load NFT purchases" });
   }
 });
 
