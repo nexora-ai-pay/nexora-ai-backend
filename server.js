@@ -1160,20 +1160,32 @@ app.get("/api/admin/analytics", requireAdmin, async (req,res)=>{
   try{
     const r=await pool.query(`
       WITH days AS (
-        SELECT generate_series(current_date-364,current_date,interval '1 day')::date AS day
+        SELECT generate_series(
+          current_date - 364,
+          current_date,
+          interval '1 day'
+        )::date AS report_day
       )
-      SELECT to_char(day,'YYYY-MM-DD') day,
-        (SELECT COUNT(*) FROM users WHERE created_at::date=day)::int users,
-        (SELECT COUNT(*) FROM deposits WHERE created_at::date=day)::int deposits,
-        (SELECT COALESCE(SUM(amount),0) FROM deposits WHERE created_at::date=day AND status='verified') deposits_amount,
-        (SELECT COUNT(*) FROM withdrawals WHERE created_at::date=day)::int withdrawals,
-        (SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE created_at::date=day AND status='completed') withdrawals_amount,
-        (SELECT COUNT(*) FROM nft_purchases WHERE purchased_at::date=day)::int nft_purchases,
-        (SELECT COALESCE(SUM(price),0) FROM nft_purchases WHERE purchased_at::date=day) nft_sales
-      FROM days ORDER BY day
+      SELECT
+        to_char(d.report_day,'YYYY-MM-DD') AS day,
+        (SELECT COUNT(*) FROM users WHERE created_at::date=d.report_day)::int AS users,
+        (SELECT COUNT(*) FROM deposits WHERE created_at::date=d.report_day)::int AS deposits,
+        (SELECT COALESCE(SUM(amount),0) FROM deposits
+          WHERE created_at::date=d.report_day AND status='verified') AS deposits_amount,
+        (SELECT COUNT(*) FROM withdrawals WHERE created_at::date=d.report_day)::int AS withdrawals,
+        (SELECT COALESCE(SUM(amount),0) FROM withdrawals
+          WHERE created_at::date=d.report_day AND status='completed') AS withdrawals_amount,
+        (SELECT COUNT(*) FROM nft_purchases WHERE purchased_at::date=d.report_day)::int AS nft_purchases,
+        (SELECT COALESCE(SUM(price),0) FROM nft_purchases
+          WHERE purchased_at::date=d.report_day) AS nft_sales
+      FROM days d
+      ORDER BY d.report_day
     `);
     res.json({success:true,days:r.rows});
-  }catch(e){console.error(e);res.status(500).json({success:false,message:"Failed to load analytics"});}
+  }catch(e){
+    console.error("Admin analytics error:",e);
+    res.status(500).json({success:false,message:"Failed to load analytics"});
+  }
 });
 
 app.get("/api/admin/earnings-forecast", requireAdmin, async (req,res)=>{
