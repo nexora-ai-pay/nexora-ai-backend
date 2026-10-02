@@ -451,7 +451,7 @@ app.get("/api/referral", requireTelegramUser, async (req, res) => {
     res.json({
       success: true,
       referral_code: referralCode,
-      referral_link: botUsername ? `https://t.me/${botUsername}?startapp=${encodeURIComponent(referralCode)}` : "",
+      referral_link: botUsername ? `https://t.me/${botUsername}?start=${encodeURIComponent(referralCode)}` : "",
       referral_count: referredUsers.length,
       total_commission: Number(totalCommission.toFixed(8)),
       total_earned: Number(totalCommission.toFixed(8)),
@@ -663,6 +663,35 @@ app.get("/api/payout-review/config",(req,res)=>{
   res.json({success:true,bot_username:username,bot_url:`https://t.me/${username}`});
 });
 
+// ==================== MAIN BOT REFERRAL START FLOW ====================
+async function startMainBotPolling(){
+  const token=String(process.env.BOT_TOKEN||"").trim();
+  if(!token){ console.warn("Main bot referral flow disabled: BOT_TOKEN is not configured."); return; }
+  const miniAppBase=String(process.env.MINI_APP_URL||"https://nexora-ai-pay.github.io/nexora-ai-mini-app/").trim();
+  let offset=0;
+  try{ await botApiWithToken(token,"deleteWebhook",{drop_pending_updates:false}); }catch(e){}
+  const loop=async()=>{
+    try{
+      const data=await botApiWithToken(token,"getUpdates",{offset,timeout:25,allowed_updates:["message"]});
+      for(const u of (data.result||[])){
+        offset=Math.max(offset,Number(u.update_id)+1);
+        const msg=u?.message; if(!msg?.chat?.id || !msg?.from) continue;
+        const text=String(msg.text||"").trim();
+        const match=text.match(/^\/start(?:@\S+)?(?:\s+(.+))?$/i); if(!match) continue;
+        const code=String(match[1]||"").trim();
+        const appUrl=code ? `${miniAppBase}${miniAppBase.includes("?")?"&":"?"}startapp=${encodeURIComponent(code)}` : miniAppBase;
+        await botApiWithToken(token,"sendMessage",{
+          chat_id:String(msg.chat.id),
+          text:code ? "👋 Welcome to Nexora AI.\n\nYour referral link has been received. Open the Mini App below to continue." : "👋 Welcome to Nexora AI.\n\n🚀 Open the Mini App below to continue.",
+          disable_web_page_preview:true,
+          reply_markup:{inline_keyboard:[[{text:"🚀 Open Nexora AI",web_app:{url:appUrl}}]]}
+        });
+      }
+    }catch(e){ console.error("Main bot referral polling error:",e.message); await new Promise(r=>setTimeout(r,3000)); }
+    setImmediate(loop);
+  }; loop();
+}
+
 // ==================== TELEGRAM SUPPORT BOT ====================
 async function telegramApi(method, body={}) {
   const token=String(process.env.SUPPORT_BOT_TOKEN||"").trim();
@@ -752,6 +781,7 @@ async function startServer() {
       setInterval(monitorBep20Deposits, Number(process.env.DEPOSIT_POLL_INTERVAL_MS || 15000));
       setInterval(finalizeDetectedDeposits, Number(process.env.DEPOSIT_CONFIRMATION_POLL_MS || 30000));
     }, 2000);
+    startMainBotPolling();
     startSupportBotPolling();
 
     
@@ -830,31 +860,14 @@ app.get("/api/admin/dashboard", requireAdmin, async (req, res) => {
 // Admin users — PostgreSQL source of truth
 app.get("/api/admin/users", requireAdmin, async (req, res) => {
   try {
-    // Read the complete PostgreSQL row so the Admin Panel remains compatible
-    // with the currently deployed users schema.
     const r = await pool.query(`
-      SELECT * FROM users
+      SELECT telegram_id, username, first_name, last_name,
+             balance, total_earned, referral_code, referred_by,
+             banned, banned_at, ban_reason, created_at, updated_at
+      FROM users
       ORDER BY created_at DESC NULLS LAST
     `);
-
-    const users = r.rows.map(u => ({
-      ...u,
-      telegram_id: String(u.telegram_id ?? ""),
-      username: u.username ?? "",
-      first_name: u.first_name ?? "",
-      last_name: u.last_name ?? "",
-      balance: Number(u.balance ?? 0),
-      total_earned: Number(u.total_earned ?? 0),
-      referral_code: u.referral_code ?? `NX${u.telegram_id ?? ""}`,
-      referred_by: u.referred_by ?? "",
-      banned: Boolean(u.banned ?? false),
-      banned_at: u.banned_at ?? null,
-      ban_reason: u.ban_reason ?? "",
-      created_at: u.created_at ?? null,
-      updated_at: u.updated_at ?? null
-    }));
-
-    res.json({ success: true, count: users.length, users });
+    res.json({ success: true, count: r.rows.length, users: r.rows });
   } catch (error) {
     console.error("Admin users error:", error);
     res.status(500).json({ success: false, message: "Failed to load users" });
@@ -1160,32 +1173,20 @@ app.get("/api/admin/analytics", requireAdmin, async (req,res)=>{
   try{
     const r=await pool.query(`
       WITH days AS (
-        SELECT generate_series(
-          current_date - 364,
-          current_date,
-          interval '1 day'
-        )::date AS report_day
+        SELECT generate_series(current_date-364,current_date,interval '1 day')::date AS day
       )
-      SELECT
-        to_char(d.report_day,'YYYY-MM-DD') AS day,
-        (SELECT COUNT(*) FROM users WHERE created_at::date=d.report_day)::int AS users,
-        (SELECT COUNT(*) FROM deposits WHERE created_at::date=d.report_day)::int AS deposits,
-        (SELECT COALESCE(SUM(amount),0) FROM deposits
-          WHERE created_at::date=d.report_day AND status='verified') AS deposits_amount,
-        (SELECT COUNT(*) FROM withdrawals WHERE created_at::date=d.report_day)::int AS withdrawals,
-        (SELECT COALESCE(SUM(amount),0) FROM withdrawals
-          WHERE created_at::date=d.report_day AND status='completed') AS withdrawals_amount,
-        (SELECT COUNT(*) FROM nft_purchases WHERE purchased_at::date=d.report_day)::int AS nft_purchases,
-        (SELECT COALESCE(SUM(price),0) FROM nft_purchases
-          WHERE purchased_at::date=d.report_day) AS nft_sales
-      FROM days d
-      ORDER BY d.report_day
+      SELECT to_char(day,'YYYY-MM-DD') day,
+        (SELECT COUNT(*) FROM users WHERE created_at::date=day)::int users,
+        (SELECT COUNT(*) FROM deposits WHERE created_at::date=day)::int deposits,
+        (SELECT COALESCE(SUM(amount),0) FROM deposits WHERE created_at::date=day AND status='verified') deposits_amount,
+        (SELECT COUNT(*) FROM withdrawals WHERE created_at::date=day)::int withdrawals,
+        (SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE created_at::date=day AND status='completed') withdrawals_amount,
+        (SELECT COUNT(*) FROM nft_purchases WHERE purchased_at::date=day)::int nft_purchases,
+        (SELECT COALESCE(SUM(price),0) FROM nft_purchases WHERE purchased_at::date=day) nft_sales
+      FROM days ORDER BY day
     `);
     res.json({success:true,days:r.rows});
-  }catch(e){
-    console.error("Admin analytics error:",e);
-    res.status(500).json({success:false,message:"Failed to load analytics"});
-  }
+  }catch(e){console.error(e);res.status(500).json({success:false,message:"Failed to load analytics"});}
 });
 
 app.get("/api/admin/earnings-forecast", requireAdmin, async (req,res)=>{
