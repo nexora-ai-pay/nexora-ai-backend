@@ -1086,11 +1086,11 @@ async function monitorBep20Deposits() {
         console.error(`BEP-20 deposit monitor chunk error ${fromBlock}-${toBlock}:`, chunkError.message);
 
 
-        if (chunkSize > 10) {
+        if (chunkSize > 1) {
 
           const oldChunkSize = chunkSize;
 
-          chunkSize = Math.max(10, Math.floor(chunkSize / 2));
+          chunkSize = Math.max(1, Math.floor(chunkSize / 2));
 
 
           console.warn(
@@ -1109,7 +1109,7 @@ async function monitorBep20Deposits() {
 
         console.error(
 
-          `BEP-20 deposit monitor could not read ${fromBlock}-${toBlock} even at minimum chunk size ${chunkSize}`
+          `BEP-20 deposit monitor could not read block ${fromBlock} even at single-block scan`
 
         );
 
