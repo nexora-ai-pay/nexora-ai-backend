@@ -1061,7 +1061,10 @@ async function monitorBep20Deposits() {
     const topic = ethers.id("Transfer(address,address,uint256)");
     const latest = await provider.getBlockNumber();
     const confRequired = Number(process.env.DEPOSIT_CONFIRMATIONS || 12);
-    const chunkSize = Math.max(50, Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS || 500));
+    let chunkSize = Math.min(
+      100,
+      Math.max(10, Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS || 100))
+    );
 
     const state = await pool.query("SELECT value FROM blockchain_scans WHERE key='deposit_last_block'");
     let fromBlock = Number(state.rows[0]?.value || 0);
