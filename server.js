@@ -1079,8 +1079,39 @@ async function monitorBep20Deposits() {
           toBlock
         });
       } catch (chunkError) {
+
         console.error(`BEP-20 deposit monitor chunk error ${fromBlock}-${toBlock}:`, chunkError.message);
+
+
+        if (chunkSize > 10) {
+
+          const oldChunkSize = chunkSize;
+
+          chunkSize = Math.max(10, Math.floor(chunkSize / 2));
+
+
+          console.warn(
+
+            `BEP-20 deposit monitor reducing scan chunk ${oldChunkSize} -> ${chunkSize} and retrying ${fromBlock}-${toBlock}`
+
+          );
+
+
+          await new Promise(resolve => setTimeout(resolve, 1200));
+
+          continue;
+
+        }
+
+
+        console.error(
+
+          `BEP-20 deposit monitor could not read ${fromBlock}-${toBlock} even at minimum chunk size ${chunkSize}`
+
+        );
+
         break;
+
       }
 
       for (const log of logs) {
