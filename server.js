@@ -778,8 +778,10 @@ async function startServer() {
     setTimeout(() => {
       monitorBep20Deposits();
       finalizeDetectedDeposits();
+      finalizeProcessingWithdrawals();
       setInterval(monitorBep20Deposits, Number(process.env.DEPOSIT_POLL_INTERVAL_MS || 15000));
       setInterval(finalizeDetectedDeposits, Number(process.env.DEPOSIT_CONFIRMATION_POLL_MS || 30000));
+      setInterval(finalizeProcessingWithdrawals, Number(process.env.WITHDRAWAL_CONFIRMATION_POLL_INTERVAL_MS || 15000));
     }, 2000);
     startMainBotPolling();
     startSupportBotPolling();
@@ -947,7 +949,7 @@ async function sendBep20Usdt(address, amount) {
   const key = String(process.env.WITHDRAWAL_PRIVATE_KEY || "").trim();
   if (!key) throw new Error("Withdrawal sending wallet is not configured");
 
-  const { provider, contract } = await getUsdtContract();
+  const { provider, contract, contractAddress } = await getUsdtContract();
   const network = await provider.getNetwork();
   if (Number(network.chainId) !== 56) throw new Error("Configured RPC is not BNB Smart Chain");
 
@@ -960,23 +962,53 @@ async function sendBep20Usdt(address, amount) {
   if (tokenBalance < tokenAmount) throw new Error("Sending wallet has insufficient USDT");
 
   const nativeBalance = await provider.getBalance(sender);
-  const gasEstimate = await contract.transfer.estimateGas(address, tokenAmount);
+  const gasLimit = BigInt(process.env.WITHDRAWAL_GAS_LIMIT || 100000);
   const feeData = await provider.getFeeData();
-  const gasPrice = feeData.gasPrice || 0n;
-  if (nativeBalance < gasEstimate * gasPrice) {
+  const gasPrice = feeData.gasPrice || ethers.parseUnits("3","gwei");
+
+  if (nativeBalance < gasLimit * gasPrice) {
     throw new Error("Sending wallet has insufficient BNB for gas");
   }
 
-  const tx = await contract.connect(wallet).transfer(address, tokenAmount);
-  const receipt = await tx.wait(Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3));
+  const data = contract.interface.encodeFunctionData("transfer",[address,tokenAmount]);
 
-  return {
-    tx_hash: tx.hash,
-    block_number: receipt?.blockNumber || null,
-    confirmations: Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3)
-  };
+  const tx = await wallet.sendTransaction({
+    to: contractAddress,
+    data,
+    gasLimit,
+    gasPrice
+  });
+
+  console.log("BEP-20 withdrawal broadcast:",tx.hash);
+
+  const confirmations = Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3);
+  const timeout = Number(process.env.WITHDRAWAL_CONFIRMATION_TIMEOUT_MS || 120000);
+
+  try {
+    const receipt = await provider.waitForTransaction(tx.hash,confirmations,timeout);
+
+    if (!receipt) {
+      return {tx_hash:tx.hash,block_number:null,confirmations:0,pending:true};
+    }
+
+    if (Number(receipt.status) !== 1) {
+      const e=new Error("BEP-20 withdrawal transaction reverted on-chain");
+      e.txHash=tx.hash;
+      e.reverted=true;
+      throw e;
+    }
+
+    return {
+      tx_hash:tx.hash,
+      block_number:receipt.blockNumber || null,
+      confirmations,
+      pending:false
+    };
+  } catch(e) {
+    if (e && e.reverted) throw e;
+    return {tx_hash:tx.hash,block_number:null,confirmations:0,pending:true};
+  }
 }
-
 async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmations) {
   const client = await pool.connect();
   try {
@@ -1166,6 +1198,134 @@ async function finalizeDetectedDeposits() {
     }
   } catch (e) {
     console.error("Deposit confirmation check error:", e.message);
+  }
+}
+
+async function finalizeProcessingWithdrawals() {
+  try {
+    const { provider } = await getBscProvider();
+
+    const rows = await pool.query(
+      `SELECT * FROM withdrawals
+       WHERE status='processing'
+       AND tx_hash IS NOT NULL
+       ORDER BY created_at ASC`
+    );
+
+    for (const w of rows.rows) {
+      const txHash=String(w.tx_hash||"").trim();
+      if(!txHash) continue;
+
+      let receipt=null;
+
+      try {
+        receipt=await provider.getTransactionReceipt(txHash);
+      } catch(e) {
+        console.error("Withdrawal receipt check failed:",txHash,e.message);
+        continue;
+      }
+
+      if(!receipt) continue;
+
+      if(Number(receipt.status)===1) {
+        const completed=await pool.query(
+          `UPDATE withdrawals
+           SET status='completed',
+               block_number=$1,
+               processed_at=COALESCE(processed_at,NOW()),
+               error_message=NULL
+           WHERE id=$2 AND status='processing'`,
+          [receipt.blockNumber||null,w.id]
+        );
+
+        if(completed.rowCount===1){
+          await adminLog(
+            "withdrawal_completed",
+            "withdrawal",
+            w.id,
+            {tx_hash:txHash,finalized:true}
+          );
+
+          const paidUser=await pool.query(
+            "SELECT first_name,last_name,username,telegram_id FROM users WHERE telegram_id=$1",
+            [String(w.telegram_id)]
+          );
+          const pu=paidUser.rows[0]||{};
+          const paidName=[pu.first_name,pu.last_name].filter(Boolean).join(" ") || pu.username || String(w.telegram_id);
+
+          void sendPayoutReviewMessage(
+            `✅ NEXORA AI PAYOUT REVIEW\\n\\nWithdrawal Approved & Sent\\n👤 ${paidName}\\n🆔 ${w.telegram_id}\\n💵 ${Number(w.amount).toFixed(4)} USDT\\n🌐 BEP-20\\n🏦 ${w.address}\\n🔗 TX: ${txHash}`
+          );
+
+          void broadcastMainBot(
+            `✅ Nexora AI — Withdrawal Sent\\n\\n👤 ${paidName}\\n💵 ${Number(w.amount).toFixed(4)} USDT\\n🌐 BEP-20 USDT\\n🟢 Status: Completed\\n🔗 TX: ${txHash}`
+          );
+        }
+
+        continue;
+      }
+
+      const client=await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        const locked=await client.query(
+          "SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE",
+          [w.id]
+        );
+
+        if(!locked.rows.length || locked.rows[0].status!=="processing") {
+          await client.query("ROLLBACK");
+          continue;
+        }
+
+        const current=locked.rows[0];
+
+        await client.query(
+          "UPDATE users SET balance=balance+$1,updated_at=NOW() WHERE telegram_id=$2",
+          [Number(current.amount),String(current.telegram_id)]
+        );
+
+        await client.query(
+          `UPDATE withdrawals
+           SET status='failed',
+               processed_at=NOW(),
+               error_message=$1
+           WHERE id=$2`,
+          ["BEP-20 transaction reverted on-chain",current.id]
+        );
+
+        await client.query("COMMIT");
+
+        await adminLog(
+          "withdrawal_failed",
+          "withdrawal",
+          current.id,
+          {
+            tx_hash:txHash,
+            error:"BEP-20 transaction reverted on-chain",
+            balance_restored:true,
+            finalized:true
+          }
+        );
+
+        void sendPayoutReviewMessage(
+          `❌ NEXORA AI PAYOUT REVIEW\\n\\nWithdrawal Failed\\n🆔 ${current.telegram_id}\\n💵 ${Number(current.amount).toFixed(4)} USDT\\n⚠️ BEP-20 transaction reverted on-chain\\n\\nUser balance was restored.\\n🔗 TX: ${txHash}`
+        );
+
+        void broadcastMainBot(
+          `❌ Nexora AI — Withdrawal Failed\\n\\n🆔 ${current.telegram_id}\\n💵 ${Number(current.amount).toFixed(4)} USDT\\n🔴 Status: Failed\\n⚠️ BEP-20 transaction reverted on-chain\\n🔗 TX: ${txHash}`
+        );
+      } catch(e) {
+        try { await client.query("ROLLBACK"); } catch(_) {}
+        console.error("Withdrawal finalization error:",e.message);
+      } finally {
+        client.release();
+      }
+    }
+  } catch(e) {
+    console.error("Withdrawal confirmation finalizer error:",e.message);
   }
 }
 
@@ -1417,6 +1577,25 @@ app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req,res)=>{
 
   try{
     const sent=await sendBep20Usdt(withdrawal.address,Number(withdrawal.amount));
+
+    if(sent.pending){
+      await pool.query(
+        `UPDATE withdrawals SET status='processing',tx_hash=$1,block_number=NULL,error_message=NULL WHERE id=$2`,
+        [sent.tx_hash,id]
+      );
+      await adminLog("withdrawal_broadcast","withdrawal",id,{
+        tx_hash:sent.tx_hash,
+        amount:Number(withdrawal.amount),
+        address:withdrawal.address
+      });
+      return res.status(202).json({
+        success:true,
+        message:"Withdrawal broadcast successfully. Waiting for blockchain confirmation.",
+        tx_hash:sent.tx_hash,
+        withdrawal:{...withdrawal,status:"processing",tx_hash:sent.tx_hash}
+      });
+    }
+
     await pool.query(`UPDATE withdrawals SET status='completed',tx_hash=$1,block_number=$2,processed_at=NOW(),error_message=NULL WHERE id=$3`,
       [sent.tx_hash,sent.block_number,id]);
     await adminLog("withdrawal_completed","withdrawal",id,{tx_hash:sent.tx_hash,amount:Number(withdrawal.amount),address:withdrawal.address});
