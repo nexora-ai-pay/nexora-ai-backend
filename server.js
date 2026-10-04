@@ -997,23 +997,9 @@ async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmatio
     if (!usr.rows.length) throw new Error("Deposit user not found");
     const user = usr.rows[0];
 
-    const amount = Number(d.amount || 0);
-    const newBalance = Number(user.balance || 0) + amount;
-    let commission = 0;
-
-    if (!d.commission_credited && user.referred_by) {
-      const ref = await client.query(
-        "SELECT * FROM users WHERE LOWER(referral_code)=LOWER($1) AND telegram_id<>$2 FOR UPDATE",
-        [String(user.referred_by), String(user.telegram_id)]
-      );
-      if (ref.rows.length) {
-        commission = Number((amount * 0.05).toFixed(8));
-        await client.query(
-          "UPDATE users SET balance=balance+$1,total_earned=total_earned+$1,updated_at=NOW() WHERE telegram_id=$2",
-          [commission, String(ref.rows[0].telegram_id)]
-        );
-      }
-    }
+const amount = Number(d.amount || 0);
+const newBalance = Number(user.balance || 0) + amount;
+const commission = 0;
 
     await client.query(
       `UPDATE users SET balance=$1, updated_at=NOW() WHERE telegram_id=$2`,
@@ -1025,19 +1011,13 @@ async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmatio
        referral_commission=$5, commission_credited=$6, verified_at=NOW()
        WHERE id=$1`,
       [String(depositId), txHash || null, blockNumber || null, Number(confirmations || 0),
-       commission, commission > 0 || Boolean(d.commission_credited)]
+0, false]
     );
 
     await client.query("COMMIT");
 
     const depositName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || String(user.telegram_id);
-    void broadcastMainBot(`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited${commission>0?`\n🎁 Referral commission: ${commission.toFixed(4)} USDT`:""}`);
-    if (commission > 0) {
-      const refUser=await pool.query("SELECT telegram_id,first_name,last_name,username FROM users WHERE LOWER(referral_code)=LOWER($1) LIMIT 1",[String(user.referred_by||"")]);
-      const ref=refUser.rows[0];
-      if(ref) void sendMainBotMessage(ref.telegram_id,`🎁 Nexora AI — Referral Commission\n\nA referred user completed a verified deposit.\n💵 Commission credited: ${commission.toFixed(4)} USDT`);
-    }
-
+void broadcastMainBot(`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited`);
     return { already: false, commission };
   } catch (e) {
     await client.query("ROLLBACK");
