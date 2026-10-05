@@ -298,7 +298,7 @@ app.post("/api/deposits", requireTelegramUser, async (req, res) => {
     db.data.deposits.push(deposit);
     await db.write();
 
-    void broadcastMainBot(`💰 Nexora AI — New Deposit Request\n\n👤 ${[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId}\n💵 Requested: ${amount.toFixed(4)} USDT\n🔢 Unique Amount: ${uniqueAmount.toFixed(6)} USDT\n🟢 Status: Pending verification`);
+    void sendMainBotMessage(telegramId,`💰 Nexora AI — New Deposit Request\n\n👤 ${[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId}\n💵 Requested: ${amount.toFixed(4)} USDT\n🔢 Unique Amount: ${uniqueAmount.toFixed(6)} USDT\n🟢 Status: Pending verification`);
 
     res.json({
       success: true,
@@ -557,7 +557,7 @@ app.post("/api/withdrawals", requireTelegramUser, async (req, res) => {
 
     const wdName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
     void sendPayoutReviewMessage(`💸 NEXORA AI PAYOUT REVIEW\n\n🆕 New Withdrawal Request\n👤 ${wdName}\n🆔 ${telegramId}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 Network: BEP-20\n🏦 Wallet: ${address}\n🕒 ${new Date().toISOString()}\n\nAdmin action required: Approve & Send / Reject`);
-    void broadcastMainBot(`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review`);
+    void sendMainBotMessage(telegramId,`💸 Nexora AI — New Withdrawal Request\n\n👤 ${wdName}\n💵 Amount: ${amount.toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟡 Status: Pending admin review`);
 
     res.json({
       success: true,
@@ -646,14 +646,14 @@ async function broadcastMainBot(text) {
   } catch(e){ console.error("Main bot broadcast error:",e.message); }
 }
 
-async function sendPayoutReviewMessage(text) {
+async function sendPayoutReviewMessage(text,extra={}) {
   const token=String(process.env.PAYOUT_REVIEW_BOT_TOKEN||"").trim();
   const chatId=String(process.env.PAYOUT_REVIEW_CHAT_ID||"").trim();
   if(!token || !chatId){
     console.warn("Payout Review notification disabled: configure PAYOUT_REVIEW_BOT_TOKEN and PAYOUT_REVIEW_CHAT_ID.");
     return;
   }
-  try { await botApiWithToken(token,"sendMessage",{chat_id:chatId,text,disable_web_page_preview:true}); }
+  try { await botApiWithToken(token,"sendMessage",{chat_id:chatId,text,disable_web_page_preview:true,...extra}); }
   catch(e){ console.error("Payout Review bot error:",e.message); }
 }
 
@@ -1032,7 +1032,7 @@ const commission = 0;
     await client.query("COMMIT");
 
     const depositName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || String(user.telegram_id);
-void broadcastMainBot(`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited`);
+void sendMainBotMessage(String(user.telegram_id),`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName}\n💵 ${amount.toFixed(4)} USDT\n🟢 Status: Verified & credited`);
     return { already: false, commission };
   } catch (e) {
     await client.query("ROLLBACK");
@@ -1369,10 +1369,11 @@ async function finalizeProcessingWithdrawals() {
           const paidName=[pu.first_name,pu.last_name].filter(Boolean).join(" ") || pu.username || String(w.telegram_id);
 
           void sendPayoutReviewMessage(
-            `✅ NEXORA AI PAYOUT REVIEW\\n\\nWithdrawal Approved & Sent\\n👤 ${paidName}\\n🆔 ${w.telegram_id}\\n💵 ${Number(w.amount).toFixed(4)} USDT\\n🌐 BEP-20\\n🏦 ${w.address}\\n🔗 TX: ${txHash}`
+            `✅ NEXORA AI PAYOUT REVIEW\\n\\nWithdrawal Approved & Sent\\n👤 ${paidName}\\n🆔 ${w.telegram_id}\\n💵 ${Number(w.amount).toFixed(4)} USDT\\n🌐 BEP-20\\n🏦 ${w.address}\\n🔗 TX: <a href="https://bscscan.com/tx/${txHash}">${txHash}</a>`,
+            {parse_mode:"HTML"}
           );
 
-          void broadcastMainBot(
+          void sendMainBotMessage(String(w.telegram_id),
             `✅ Nexora AI — Withdrawal Sent\\n\\n👤 ${paidName}\\n💵 ${Number(w.amount).toFixed(4)} USDT\\n🌐 BEP-20 USDT\\n🟢 Status: Completed\\n🔗 TX: ${txHash}`
           );
         }
@@ -1429,7 +1430,7 @@ async function finalizeProcessingWithdrawals() {
           `❌ NEXORA AI PAYOUT REVIEW\\n\\nWithdrawal Failed\\n🆔 ${current.telegram_id}\\n💵 ${Number(current.amount).toFixed(4)} USDT\\n⚠️ BEP-20 transaction reverted on-chain\\n\\nUser balance was restored.\\n🔗 TX: ${txHash}`
         );
 
-        void broadcastMainBot(
+        void sendMainBotMessage(String(current.telegram_id),
           `❌ Nexora AI — Withdrawal Failed\\n\\n🆔 ${current.telegram_id}\\n💵 ${Number(current.amount).toFixed(4)} USDT\\n🔴 Status: Failed\\n⚠️ BEP-20 transaction reverted on-chain\\n🔗 TX: ${txHash}`
         );
       } catch(e) {
@@ -1717,8 +1718,8 @@ app.post("/api/admin/withdrawals/:id/process", requireAdmin, async (req,res)=>{
     const paidUser=await pool.query("SELECT first_name,last_name,username,telegram_id FROM users WHERE telegram_id=$1",[String(withdrawal.telegram_id)]);
     const pu=paidUser.rows[0]||{};
     const paidName=[pu.first_name,pu.last_name].filter(Boolean).join(" ") || pu.username || String(withdrawal.telegram_id);
-    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: ${sent.tx_hash}`);
-    void broadcastMainBot(`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}`);
+    void sendPayoutReviewMessage(`✅ NEXORA AI PAYOUT REVIEW\n\nWithdrawal Approved & Sent\n👤 ${paidName}\n🆔 ${withdrawal.telegram_id}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20\n🏦 ${withdrawal.address}\n🔗 TX: <a href="https://bscscan.com/tx/${sent.tx_hash}">${sent.tx_hash}</a>`,{parse_mode:"HTML"});
+    void sendMainBotMessage(String(withdrawal.telegram_id),`✅ Nexora AI — Withdrawal Sent\n\n👤 ${paidName}\n💵 ${Number(withdrawal.amount).toFixed(4)} USDT\n🌐 BEP-20 USDT\n🟢 Status: Completed\n🔗 TX: ${sent.tx_hash}`);
     return res.json({success:true,message:"Withdrawal approved and sent on BEP-20",tx_hash:sent.tx_hash,withdrawal:{...withdrawal,status:"completed",tx_hash:sent.tx_hash}});
   }catch(e){
     await pool.query("UPDATE users SET balance=balance+$1,updated_at=NOW() WHERE telegram_id=$2",[Number(withdrawal.amount),String(withdrawal.telegram_id)]);
@@ -1735,7 +1736,7 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req,res)=>{
   if(!r.rows.length)return res.status(409).json({success:false,message:"Withdrawal not found or already processed"});
   await adminLog("withdrawal_rejected","withdrawal",id,{});
   void sendPayoutReviewMessage(`🚫 NEXORA AI PAYOUT REVIEW\n\nWithdrawal Rejected\n🆔 ${r.rows[0].telegram_id}\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT`);
-  void broadcastMainBot(`🚫 Nexora AI — Withdrawal Rejected\n\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT\n🔴 Status: Rejected`);
+  void sendMainBotMessage(String(r.rows[0].telegram_id),`🚫 Nexora AI — Withdrawal Rejected\n\n💵 ${Number(r.rows[0].amount||0).toFixed(4)} USDT\n🔴 Status: Rejected`);
   res.json({success:true,message:"Withdrawal rejected",withdrawal:r.rows[0]});
 });
 
@@ -2122,7 +2123,7 @@ app.post("/api/nft/purchase", requireTelegramUser, async (req, res) => {
     await db.write();
 
     const nftBuyerName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
-    void broadcastMainBot(`🖼️ Nexora AI — NFT Purchase\n\n👤 ${nftBuyerName}\n💎 Plan: ${nft.name}\n💵 Price: ${Number(nft.price).toFixed(2)} USDT\n🟢 Status: Active${referralCommission>0?`\n🎁 Referral commission credited: ${referralCommission.toFixed(4)} USDT`:""}`);
+    void sendMainBotMessage(telegramId,`🖼️ Nexora AI — NFT Purchase\n\n👤 ${nftBuyerName}\n💎 Plan: ${nft.name}\n💵 Price: ${Number(nft.price).toFixed(2)} USDT\n🟢 Status: Active${referralCommission>0?`\n🎁 Referral commission credited: ${referralCommission.toFixed(4)} USDT`:""}`);
     if (referralCommission > 0 && referrerTelegramId) {
       void sendMainBotMessage(referrerTelegramId,`🎁 Nexora AI — 5% Referral NFT Commission\n\nYour referred user purchased ${nft.name}.\n💵 Commission: ${referralCommission.toFixed(4)} USDT\n🟢 Commission credited to your balance.`);
     }
