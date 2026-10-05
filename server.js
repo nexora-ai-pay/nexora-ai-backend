@@ -972,6 +972,9 @@ async function sendBep20Usdt(address, amount) {
 
   const data = contract.interface.encodeFunctionData("transfer",[address,tokenAmount]);
 
+  // Persisting the TX hash immediately after broadcast is critical: if the
+  // server restarts while waiting for confirmations, the finalizer can still
+  // recover and complete the withdrawal from the saved hash.
   const tx = await wallet.sendTransaction({
     to: contractAddress,
     data,
@@ -979,36 +982,16 @@ async function sendBep20Usdt(address, amount) {
     gasPrice
   });
 
-  console.log("BEP-20 withdrawal broadcast:",tx.hash);
+  console.log("BEP-20 withdrawal broadcast:", tx.hash);
 
-  const confirmations = Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3);
-  const timeout = Number(process.env.WITHDRAWAL_CONFIRMATION_TIMEOUT_MS || 120000);
-
-  try {
-    const receipt = await provider.waitForTransaction(tx.hash,confirmations,timeout);
-
-    if (!receipt) {
-      return {tx_hash:tx.hash,block_number:null,confirmations:0,pending:true};
-    }
-
-    if (Number(receipt.status) !== 1) {
-      const e=new Error("BEP-20 withdrawal transaction reverted on-chain");
-      e.txHash=tx.hash;
-      e.reverted=true;
-      throw e;
-    }
-
-    return {
-      tx_hash:tx.hash,
-      block_number:receipt.blockNumber || null,
-      confirmations,
-      pending:false
-    };
-  } catch(e) {
-    if (e && e.reverted) throw e;
-    return {tx_hash:tx.hash,block_number:null,confirmations:0,pending:true};
-  }
+  return {
+    tx_hash: tx.hash,
+    block_number: null,
+    confirmations: 0,
+    pending: true
+  };
 }
+
 async function creditVerifiedDeposit(depositId, txHash, blockNumber, confirmations) {
   const client = await pool.connect();
   try {
@@ -1059,124 +1042,195 @@ void broadcastMainBot(`💰 Nexora AI — Deposit Verified\n\n👤 ${depositName
   }
 }
 
-async function monitorBep20Deposits() {
-  const rpc = String(process.env.BSC_RPC_URL || "").trim();
-  const depositAddress = String(process.env.DEPOSIT_WALLET_ADDRESS || "").trim();
-  if (!rpc || !isValidBscAddress(depositAddress)) {
-    console.warn("BEP-20 deposit monitor disabled: configure BSC_RPC_URL and DEPOSIT_WALLET_ADDRESS.");
-    return;
+let depositMonitorRunning = false;
+
+async function processBep20DepositLogs(provider, usdt, topic, depositAddress, logs, latest, confRequired) {
+  for (const log of logs) {
+    const txHash = log.transactionHash;
+    const already = await pool.query("SELECT id FROM deposits WHERE tx_hash=$1 LIMIT 1", [txHash]);
+    if (already.rows.length) continue;
+
+    const amountRaw = BigInt(log.data);
+    const amount = Number(ethers.formatUnits(amountRaw, 18));
+    const matching = await pool.query(
+      `SELECT * FROM deposits
+       WHERE status IN ('pending','detected')
+         AND LOWER(deposit_address)=LOWER($1)
+         AND network='BEP-20' AND token='USDT'
+         AND ABS(amount-$2) < 0.000000001
+       ORDER BY created_at ASC LIMIT 1`,
+      [depositAddress, amount]
+    );
+
+    if (!matching.rows.length) {
+      const fromAddress = "0x" + String(log.topics?.[1] || "").slice(-40);
+      await pool.query(
+        `INSERT INTO unmatched_deposits(tx_hash,from_address,to_address,amount,block_number,reason)
+         VALUES($1,$2,$3,$4,$5,$6)
+         ON CONFLICT(tx_hash) DO NOTHING`,
+        [txHash,fromAddress,depositAddress,amount,log.blockNumber,"No pending deposit with exact unique amount"]
+      );
+      continue;
+    }
+
+    const confirmations = Math.max(0, latest - log.blockNumber + 1);
+    const dep = matching.rows[0];
+    await pool.query(
+      `UPDATE deposits SET status='detected', tx_hash=$1, block_number=$2, confirmations=$3
+       WHERE id=$4 AND status IN ('pending','detected')`,
+      [txHash, log.blockNumber, confirmations, dep.id]
+    );
+
+    if (confirmations >= confRequired) {
+      await creditVerifiedDeposit(dep.id, txHash, log.blockNumber, confirmations);
+    }
+  }
+}
+
+async function getBep20LogsAdaptive(provider, filter, fromBlock, toBlock) {
+  let chunkSize = Math.max(1, toBlock - fromBlock + 1);
+
+  while (true) {
+    const end = Math.min(toBlock, fromBlock + chunkSize - 1);
+    try {
+      const logs = await provider.getLogs({ ...filter, fromBlock, toBlock: end });
+      return { logs, toBlock: end, chunkSize };
+    } catch (e) {
+      if (chunkSize === 1) {
+        throw new Error(`BEP-20 RPC cannot read block ${fromBlock}: ${e.message}`);
+      }
+      const nextSize = Math.max(1, Math.floor(chunkSize / 2));
+      console.warn(
+        `BEP-20 deposit RPC chunk ${fromBlock}-${end} failed; retrying with ${nextSize} blocks: ${e.message}`
+      );
+      chunkSize = nextSize;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
+}
+
+async function scanBep20DepositRange(provider, usdt, topic, depositAddress, startBlock, endBlock, latest, confRequired, maxBlocksPerRun) {
+  if (startBlock > endBlock) return endBlock;
+
+  let cursor = startBlock;
+  let scanned = 0;
+  const safeChunk = Math.max(1, Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS || 100));
+
+  while (cursor <= endBlock && scanned < maxBlocksPerRun) {
+    const requestedEnd = Math.min(endBlock, cursor + safeChunk - 1, cursor + (maxBlocksPerRun - scanned) - 1);
+    const result = await getBep20LogsAdaptive(
+      provider,
+      { address: usdt, topics: [topic, null, ethers.zeroPadValue(depositAddress, 32)] },
+      cursor,
+      requestedEnd
+    );
+
+    await processBep20DepositLogs(
+      provider,
+      usdt,
+      topic,
+      depositAddress,
+      result.logs,
+      latest,
+      confRequired
+    );
+
+    await pool.query(
+      `INSERT INTO blockchain_scans(key,value,updated_at) VALUES('deposit_last_block',$1,NOW())
+       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at`,
+      [String(result.toBlock)]
+    );
+
+    scanned += result.toBlock - cursor + 1;
+    cursor = result.toBlock + 1;
   }
 
+  return cursor - 1;
+}
+
+async function monitorBep20Deposits() {
+  if (depositMonitorRunning) return;
+  depositMonitorRunning = true;
+
   try {
+    const rpc = String(process.env.BSC_RPC_URL || "").trim();
+    const depositAddress = String(process.env.DEPOSIT_WALLET_ADDRESS || "").trim();
+    if (!rpc || !isValidBscAddress(depositAddress)) {
+      console.warn("BEP-20 deposit monitor disabled: configure BSC_RPC_URL and DEPOSIT_WALLET_ADDRESS.");
+      return;
+    }
+
     const provider = await getBscProvider();
-    const usdt = String(process.env.BSC_USDT_CONTRACT || "0x55d398326f99059fF775485246999027B3197955").toLowerCase();
+    const usdt = String(
+      process.env.BSC_USDT_CONTRACT || "0x55d398326f99059fF775485246999027B3197955"
+    ).toLowerCase();
     const topic = ethers.id("Transfer(address,address,uint256)");
     const latest = await provider.getBlockNumber();
     const confRequired = Number(process.env.DEPOSIT_CONFIRMATIONS || 12);
-    let chunkSize = Math.min(
-      100,
-      Math.max(10, Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS || 100))
-    );
 
+    // Always scan the newest blocks first so a new payment is never stuck
+    // behind a large historical backlog.
+    const liveLookback = Math.max(20, Number(process.env.DEPOSIT_LIVE_LOOKBACK_BLOCKS || 120));
+    const liveStart = Math.max(0, latest - liveLookback + 1);
+
+    try {
+      const liveResult = await getBep20LogsAdaptive(
+        provider,
+        { address: usdt, topics: [topic, null, ethers.zeroPadValue(depositAddress, 32)] },
+        liveStart,
+        latest
+      );
+      await processBep20DepositLogs(
+        provider,
+        usdt,
+        topic,
+        depositAddress,
+        liveResult.logs,
+        latest,
+        confRequired
+      );
+    } catch (e) {
+      console.error("BEP-20 live deposit scan error:", e.message);
+    }
+
+    // Historical recovery runs separately and in bounded slices. It can never
+    // block the live scan above, and every successful block range is checkpointed.
     const state = await pool.query("SELECT value FROM blockchain_scans WHERE key='deposit_last_block'");
     let fromBlock = Number(state.rows[0]?.value || 0);
-    if (!fromBlock) fromBlock = Math.max(0, latest - Number(process.env.DEPOSIT_SCAN_LOOKBACK_BLOCKS || 5000));
-    if (fromBlock > latest) fromBlock = latest;
-
-    while (fromBlock <= latest) {
-      const toBlock = Math.min(latest, fromBlock + chunkSize - 1);
-      let logs;
-      try {
-        logs = await provider.getLogs({
-          address: usdt,
-          topics: [topic, null, ethers.zeroPadValue(depositAddress, 32)],
-          fromBlock,
-          toBlock
-        });
-      } catch (chunkError) {
-
-        console.error(`BEP-20 deposit monitor chunk error ${fromBlock}-${toBlock}:`, chunkError.message);
-
-
-        if (chunkSize > 1) {
-
-          const oldChunkSize = chunkSize;
-
-          chunkSize = Math.max(1, Math.floor(chunkSize / 2));
-
-
-          console.warn(
-
-            `BEP-20 deposit monitor reducing scan chunk ${oldChunkSize} -> ${chunkSize} and retrying ${fromBlock}-${toBlock}`
-
-          );
-
-
-          await new Promise(resolve => setTimeout(resolve, 1200));
-
-          continue;
-
-        }
-
-
-        console.error(
-
-          `BEP-20 deposit monitor could not read block ${fromBlock} even at single-block scan`
-
-        );
-
-        break;
-
-      }
-
-      for (const log of logs) {
-        const txHash = log.transactionHash;
-        const already = await pool.query("SELECT id FROM deposits WHERE tx_hash=$1 LIMIT 1", [txHash]);
-        if (already.rows.length) continue;
-
-        const amountRaw = BigInt(log.data);
-        const amount = Number(ethers.formatUnits(amountRaw, 18));
-        const matching = await pool.query(
-          `SELECT * FROM deposits
-           WHERE status IN ('pending','detected')
-             AND LOWER(deposit_address)=LOWER($1)
-             AND network='BEP-20' AND token='USDT'
-             AND ABS(amount-$2) < 0.000000001
-           ORDER BY created_at ASC LIMIT 1`,
-          [depositAddress, amount]
-        );
-
-        if (!matching.rows.length) {
-          const fromAddress = "0x" + String(log.topics?.[1] || "").slice(-40);
-          await pool.query(
-            `INSERT INTO unmatched_deposits(tx_hash,from_address,to_address,amount,block_number,reason)
-             VALUES($1,$2,$3,$4,$5,$6)
-             ON CONFLICT(tx_hash) DO NOTHING`,
-            [txHash,fromAddress,depositAddress,amount,log.blockNumber,"No pending deposit with exact unique amount"]
-          );
-          await adminLog("unmatched_deposit","blockchain",txHash,{amount,depositAddress,blockNumber:log.blockNumber});
-          continue;
-        }
-
-        const confirmations = Math.max(0, latest - log.blockNumber + 1);
-        const dep = matching.rows[0];
-        await pool.query(
-          `UPDATE deposits SET status='detected', tx_hash=$1, block_number=$2, confirmations=$3
-           WHERE id=$4 AND status IN ('pending','detected')`,
-          [txHash, log.blockNumber, confirmations, dep.id]
-        );
-        if (confirmations >= confRequired) await creditVerifiedDeposit(dep.id, txHash, log.blockNumber, confirmations);
-      }
-
-      await pool.query(
-        `INSERT INTO blockchain_scans(key,value,updated_at) VALUES('deposit_last_block',$1,NOW())
-         ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at`,
-        [String(toBlock)]
+    if (!fromBlock) {
+      fromBlock = Math.max(
+        0,
+        latest - Number(process.env.DEPOSIT_SCAN_LOOKBACK_BLOCKS || 5000)
       );
-      fromBlock = toBlock + 1;
+    }
+
+    const historicalEnd = liveStart - 1;
+    if (fromBlock <= historicalEnd) {
+      const maxHistoricalBlocks = Math.max(
+        1,
+        Number(process.env.DEPOSIT_HISTORICAL_BLOCKS_PER_RUN || 1000)
+      );
+
+      try {
+        await scanBep20DepositRange(
+          provider,
+          usdt,
+          topic,
+          depositAddress,
+          fromBlock,
+          historicalEnd,
+          latest,
+          confRequired,
+          maxHistoricalBlocks
+        );
+      } catch (e) {
+        console.error("BEP-20 historical deposit scan error:", e.message);
+      }
     }
   } catch (e) {
     console.error("BEP-20 deposit monitor error:", e.message);
+  } finally {
+    depositMonitorRunning = false;
   }
 }
 
@@ -1228,6 +1282,11 @@ async function finalizeProcessingWithdrawals() {
       if(!receipt) continue;
 
       if(Number(receipt.status)===1) {
+        const latest = await provider.getBlockNumber();
+        const required = Number(process.env.WITHDRAWAL_CONFIRMATIONS || 3);
+        const confirmations = Math.max(0, latest - Number(receipt.blockNumber || 0) + 1);
+        if (confirmations < required) continue;
+
         const completed=await pool.query(
           `UPDATE withdrawals
            SET status='completed',
@@ -1243,7 +1302,7 @@ async function finalizeProcessingWithdrawals() {
             "withdrawal_completed",
             "withdrawal",
             w.id,
-            {tx_hash:txHash,finalized:true}
+            {tx_hash:txHash,confirmations,finalized:true}
           );
 
           const paidUser=await pool.query(
