@@ -680,11 +680,20 @@ async function startMainBotPolling(){
         const match=text.match(/^\/start(?:@\S+)?(?:\s+(.+))?$/i); if(!match) continue;
         const code=String(match[1]||"").trim();
         const appUrl=code ? `${miniAppBase}${miniAppBase.includes("?")?"&":"?"}startapp=${encodeURIComponent(code)}` : miniAppBase;
-        await botApiWithToken(token,"sendMessage",{
+        const welcomeCaption=code
+          ? "🚀 NEXORA AI — PROJECT IS LIVE!\n\n🤖 AI Auto Pay Ecosystem\n⛏️ Mine • 💰 Earn • 🤖 AI Trading Bot\n💎 9 NFT Plans • ⚡ Fast Withdrawals\n✨ Earn Daily High Rewards\n\n🎯 Your referral link is ready. Start earning now!"
+          : "🚀 NEXORA AI — PROJECT IS LIVE!\n\n🤖 AI Auto Pay Ecosystem\n⛏️ Mine • 💰 Earn • 🤖 AI Trading Bot\n💎 9 NFT Plans • ⚡ Fast Withdrawals\n🌍 Global Community\n✨ Earn Daily High Rewards\n\n🔥 Start your Nexora AI journey now!";
+
+        await botApiWithToken(token,"sendPhoto",{
           chat_id:String(msg.chat.id),
-          text:code ? "👋 Welcome to Nexora AI.\n\nYour referral link has been received. Open the Mini App below to continue." : "👋 Welcome to Nexora AI.\n\n🚀 Open the Mini App below to continue.",
-          disable_web_page_preview:true,
-          reply_markup:{inline_keyboard:[[{text:"🚀 Open Nexora AI",web_app:{url:appUrl}}]]}
+          photo:"https://nexora-ai-pay.github.io/nexora-ai-mini-app/nexora-bot-welcome.png",
+          caption:welcomeCaption,
+          reply_markup:{
+            inline_keyboard:[
+              [{text:"🚀 Start Earning",web_app:{url:appUrl}}],
+              [{text:"📢 Nexora AI Official Channel",url:"https://t.me/nexora_ai_pay"}]
+            ]
+          }
         });
       }
     }catch(e){ console.error("Main bot referral polling error:",e.message); await new Promise(r=>setTimeout(r,3000)); }
