@@ -5,6 +5,8 @@ require("dotenv").config();
 
 const { db, initDatabase } = require("./database");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { ethers } = require("ethers");
 const { pool } = require("./database");
 
@@ -664,6 +666,25 @@ app.get("/api/payout-review/config",(req,res)=>{
 });
 
 // ==================== MAIN BOT REFERRAL START FLOW ====================
+async function sendMainBotWelcomePhoto(token, chatId, caption, appUrl){
+  const imagePath=path.join(__dirname,"nexora-bot-welcome.png");
+  const image=await fs.promises.readFile(imagePath);
+  const form=new FormData();
+  form.append("chat_id",String(chatId));
+  form.append("photo",new Blob([image],{type:"image/png"}),"nexora-bot-welcome.png");
+  form.append("caption",caption);
+  form.append("reply_markup",JSON.stringify({
+    inline_keyboard:[
+      [{text:"🚀 Start Earning",web_app:{url:appUrl}}],
+      [{text:"📢 Nexora AI Official Channel",url:"https://t.me/nexora_ai_pay"}]
+    ]
+  }));
+  const r=await fetch(`https://api.telegram.org/bot${String(token).trim()}/sendPhoto`,{method:"POST",body:form});
+  const data=await r.json();
+  if(!data.ok) throw new Error(data.description||"Telegram sendPhoto error");
+  return data;
+}
+
 async function startMainBotPolling(){
   const token=String(process.env.BOT_TOKEN||"").trim();
   if(!token){ console.warn("Main bot referral flow disabled: BOT_TOKEN is not configured."); return; }
@@ -683,18 +704,7 @@ async function startMainBotPolling(){
         const welcomeCaption=code
           ? "🚀 NEXORA AI — PROJECT IS LIVE!\n\n🤖 AI Auto Pay Ecosystem\n⛏️ Mine • 💰 Earn • 🤖 AI Trading Bot\n💎 9 NFT Plans • ⚡ Fast Withdrawals\n✨ Earn Daily High Rewards\n\n🎯 Your referral link is ready. Start earning now!"
           : "🚀 NEXORA AI — PROJECT IS LIVE!\n\n🤖 AI Auto Pay Ecosystem\n⛏️ Mine • 💰 Earn • 🤖 AI Trading Bot\n💎 9 NFT Plans • ⚡ Fast Withdrawals\n🌍 Global Community\n✨ Earn Daily High Rewards\n\n🔥 Start your Nexora AI journey now!";
-
-        await botApiWithToken(token,"sendPhoto",{
-          chat_id:String(msg.chat.id),
-          photo:"https://nexora-ai-pay.github.io/nexora-ai-mini-app/nexora-bot-welcome.png",
-          caption:welcomeCaption,
-          reply_markup:{
-            inline_keyboard:[
-              [{text:"🚀 Start Earning",web_app:{url:appUrl}}],
-              [{text:"📢 Nexora AI Official Channel",url:"https://t.me/nexora_ai_pay"}]
-            ]
-          }
-        });
+        await sendMainBotWelcomePhoto(token,String(msg.chat.id),welcomeCaption,appUrl);
       }
     }catch(e){ console.error("Main bot referral polling error:",e.message); await new Promise(r=>setTimeout(r,3000)); }
     setImmediate(loop);
