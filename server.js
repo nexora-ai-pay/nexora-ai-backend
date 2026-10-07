@@ -1590,6 +1590,146 @@ app.get("/api/admin/deposits/unmatched", requireAdmin, async (req,res)=>{
   const r=await pool.query("SELECT * FROM unmatched_deposits WHERE resolved=false ORDER BY created_at DESC LIMIT 500");
   res.json({success:true,deposits:r.rows});
 });
+app.post("/api/admin/deposits/unmatched/:id/credit", requireAdmin, async (req,res)=>{
+  const unmatchedId=String(req.params.id||"").trim();
+  const telegramId=String(req.body?.telegram_id||"").trim();
+  if(!unmatchedId || !telegramId){
+    return res.status(400).json({success:false,message:"Unmatched deposit ID and user are required"});
+  }
+
+  const client=await pool.connect();
+  try{
+    await client.query("BEGIN");
+
+    const ur=await client.query(
+      "SELECT * FROM unmatched_deposits WHERE id=$1 AND resolved=false FOR UPDATE",
+      [unmatchedId]
+    );
+    if(!ur.rows.length){
+      await client.query("ROLLBACK");
+      return res.status(404).json({success:false,message:"Unmatched deposit not found or already resolved"});
+    }
+    const unmatched=ur.rows[0];
+
+    const userResult=await client.query(
+      "SELECT telegram_id,username,first_name,last_name,balance,banned FROM users WHERE telegram_id=$1 FOR UPDATE",
+      [telegramId]
+    );
+    if(!userResult.rows.length){
+      await client.query("ROLLBACK");
+      return res.status(404).json({success:false,message:"User not found"});
+    }
+    const user=userResult.rows[0];
+    if(user.banned){
+      await client.query("ROLLBACK");
+      return res.status(400).json({success:false,message:"Cannot credit a banned user"});
+    }
+
+    const txHash=String(unmatched.tx_hash||"").trim();
+    const depositAddress=String(process.env.DEPOSIT_WALLET_ADDRESS||"").trim().toLowerCase();
+    const usdtAddress=String(process.env.BSC_USDT_CONTRACT||"0x55d398326f99059fF775485246999027B3197955").trim().toLowerCase();
+    if(!txHash || !isValidBscAddress(depositAddress) || !isValidBscAddress(usdtAddress)){
+      await client.query("ROLLBACK");
+      return res.status(400).json({success:false,message:"Blockchain verification configuration is invalid"});
+    }
+
+    const provider=await getBscProvider();
+    const receipt=await provider.getTransactionReceipt(txHash);
+    if(!receipt){
+      await client.query("ROLLBACK");
+      return res.status(409).json({success:false,message:"Transaction receipt is not available yet"});
+    }
+    if(Number(receipt.status)!==1){
+      await client.query("ROLLBACK");
+      return res.status(400).json({success:false,message:"Blockchain transaction failed or reverted"});
+    }
+
+    const latest=await provider.getBlockNumber();
+    const confirmations=Math.max(0,latest-Number(receipt.blockNumber||0)+1);
+    const required=Math.max(1,Number(process.env.DEPOSIT_CONFIRMATIONS||12));
+    if(confirmations<required){
+      await client.query("ROLLBACK");
+      return res.status(409).json({success:false,message:`Deposit needs ${required} confirmations; currently ${confirmations}`});
+    }
+
+    const transferInterface=new ethers.Interface([
+      "event Transfer(address indexed from,address indexed to,uint256 value)"
+    ]);
+    let verifiedTransfer=null;
+    for(const log of (receipt.logs||[])){
+      if(String(log.address||"").toLowerCase()!==usdtAddress) continue;
+      try{
+        const parsed=transferInterface.parseLog(log);
+        if(!parsed || parsed.name!=="Transfer") continue;
+        const to=String(parsed.args.to||"").toLowerCase();
+        const value=BigInt(parsed.args.value);
+        if(to!==depositAddress) continue;
+        verifiedTransfer={
+          from:String(parsed.args.from||"").toLowerCase(),
+          to,
+          value
+        };
+        break;
+      }catch(_){}
+    }
+    if(!verifiedTransfer){
+      await client.query("ROLLBACK");
+      return res.status(400).json({success:false,message:"Verified USDT transfer to the Nexora deposit wallet was not found in this transaction"});
+    }
+
+    const actualAmount=Number(ethers.formatUnits(verifiedTransfer.value,18));
+    const recordedAmount=Number(unmatched.amount||0);
+    if(!Number.isFinite(actualAmount) || Math.abs(actualAmount-recordedAmount)>0.000000001){
+      await client.query("ROLLBACK");
+      return res.status(400).json({success:false,message:`On-chain amount ${actualAmount} USDT does not match unmatched amount ${recordedAmount} USDT`});
+    }
+
+    const newBalance=Number(user.balance||0)+actualAmount;
+    await client.query(
+      "UPDATE users SET balance=$1,updated_at=NOW() WHERE telegram_id=$2",
+      [newBalance,telegramId]
+    );
+    const resolved=await client.query(
+      `UPDATE unmatched_deposits
+       SET resolved=true,resolved_at=NOW()
+       WHERE id=$1 AND resolved=false
+       RETURNING *`,
+      [unmatchedId]
+    );
+    if(!resolved.rows.length) throw new Error("Unmatched deposit was already resolved");
+
+    await adminLog("unmatched_deposit_credited","deposit",unmatchedId,{
+      telegram_id:telegramId,
+      amount:actualAmount,
+      tx_hash:txHash,
+      block_number:receipt.blockNumber,
+      confirmations,
+      verified_on_chain:true
+    });
+
+    await client.query("COMMIT");
+
+    const userName=[user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || telegramId;
+    void sendMainBotMessage(telegramId,`💰 Nexora AI — Deposit Verified\n\n👤 ${userName}\n💵 ${actualAmount.toFixed(6)} USDT\n🟢 Status: Verified & credited`);
+
+    res.json({
+      success:true,
+      amount:actualAmount,
+      telegram_id:telegramId,
+      new_balance:newBalance,
+      confirmations,
+      tx_hash:txHash,
+      deposit:resolved.rows[0]
+    });
+  }catch(e){
+    try{await client.query("ROLLBACK");}catch(_){}
+    console.error("Admin unmatched deposit credit error:",e);
+    res.status(500).json({success:false,message:e.message||"Failed to verify and credit unmatched deposit"});
+  }finally{
+    client.release();
+  }
+});
+
 app.post("/api/admin/deposits/unmatched/:id/resolve", requireAdmin, async (req,res)=>{
   const r=await pool.query("UPDATE unmatched_deposits SET resolved=true,resolved_at=NOW() WHERE id=$1 AND resolved=false RETURNING *",[req.params.id]);
   if(!r.rows.length)return res.status(404).json({success:false,message:"Unmatched deposit not found"});
