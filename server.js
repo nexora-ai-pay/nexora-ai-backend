@@ -111,6 +111,159 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// ==================== FREE EARNING USDT SYSTEM ====================
+// Additive module only. Existing deposit, withdrawal, NFT purchase and NFT mining logic is unchanged.
+const FREE_EARNING_AMOUNT = 0.003;
+const FREE_EARNING_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const FREE_REFERRAL_REWARD = 0.02;
+
+async function ensureFreeEarningData() {
+  await db.read();
+  db.data.free_earning_claims ||= [];
+  db.data.free_earning_history ||= [];
+  db.data.free_referral_rewards ||= [];
+}
+
+function freeEarningEligible(user) {
+  return Boolean(user && String(user.telegram_id || "").trim() && !Boolean(user.banned));
+}
+
+async function creditFreeReferralReward(referredUser) {
+  if (!referredUser || !referredUser.referred_by) return null;
+  db.data.free_referral_rewards ||= [];
+
+  const referredId = String(referredUser.telegram_id);
+  if (db.data.free_referral_rewards.some(r => String(r.referred_telegram_id) === referredId)) return null;
+
+  const referrer = db.data.users.find(
+    u => String(u.referral_code || "").trim().toLowerCase() === String(referredUser.referred_by || "").trim().toLowerCase()
+  );
+  if (!referrer || String(referrer.telegram_id) === referredId || Boolean(referrer.banned)) return null;
+
+  const now = new Date().toISOString();
+  referrer.balance = Number((Number(referrer.balance || 0) + FREE_REFERRAL_REWARD).toFixed(8));
+  referrer.total_earned = Number((Number(referrer.total_earned || 0) + FREE_REFERRAL_REWARD).toFixed(8));
+  referrer.updated_at = now;
+
+  const reward = {
+    id: "FR-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex"),
+    referrer_telegram_id: String(referrer.telegram_id),
+    referred_telegram_id: referredId,
+    referral_code: String(referrer.referral_code || ""),
+    amount: FREE_REFERRAL_REWARD,
+    reward_type: "FREE_REFERRAL",
+    status: "credited",
+    created_at: now
+  };
+  db.data.free_referral_rewards.push(reward);
+  return reward;
+}
+
+app.get("/api/free-earning", requireTelegramUser, async (req, res) => {
+  try {
+    await ensureFreeEarningData();
+    const telegramId = String(req.telegramUser.id);
+    const user = db.data.users.find(u => String(u.telegram_id) === telegramId);
+    if (!freeEarningEligible(user)) return res.status(403).json({success:false,message:"Free Earning is available only to eligible active Telegram users."});
+
+    const claim = db.data.free_earning_claims.find(c => String(c.telegram_id) === telegramId);
+    const lastClaimMs = claim?.last_claim_at ? new Date(claim.last_claim_at).getTime() : 0;
+    const nowMs = Date.now();
+    const remainingMs = lastClaimMs ? Math.max(0, FREE_EARNING_INTERVAL_MS - (nowMs - lastClaimMs)) : 0;
+    const rewards = db.data.free_referral_rewards.filter(r => String(r.referrer_telegram_id) === telegramId && r.status === "credited");
+    const referralCount = db.data.users.filter(u => String(u.referred_by || "").trim().toLowerCase() === String(user.referral_code || "").trim().toLowerCase()).length;
+
+    res.json({
+      success:true, eligible:true, daily_amount:FREE_EARNING_AMOUNT, interval_ms:FREE_EARNING_INTERVAL_MS,
+      available:remainingMs<=0, last_claim_at:claim?.last_claim_at||null,
+      next_claim_at:remainingMs>0?new Date(nowMs+remainingMs).toISOString():new Date(nowMs).toISOString(),
+      remaining_ms:remainingMs, total_claims:Number(claim?.claim_count||0),
+      total_free_earned:Number(claim?.total_earned||0), referral_reward:FREE_REFERRAL_REWARD,
+      referral_reward_count:rewards.length,
+      referral_reward_total:Number(rewards.reduce((a,r)=>a+Number(r.amount||0),0).toFixed(8)),
+      referral_count:referralCount
+    });
+  } catch(e) {
+    console.error("Free earning data error:",e);
+    res.status(500).json({success:false,message:"Unable to load Free Earning data"});
+  }
+});
+
+app.post("/api/free-earning/claim", requireTelegramUser, async (req, res) => {
+  try {
+    await ensureFreeEarningData();
+    const telegramId=String(req.telegramUser.id);
+    const user=db.data.users.find(u=>String(u.telegram_id)===telegramId);
+    if(!freeEarningEligible(user)) return res.status(403).json({success:false,message:"Free Earning is available only to eligible active Telegram users."});
+
+    let claim=db.data.free_earning_claims.find(c=>String(c.telegram_id)===telegramId);
+    const nowMs=Date.now();
+    const lastClaimMs=claim?.last_claim_at?new Date(claim.last_claim_at).getTime():0;
+    const elapsed=lastClaimMs?nowMs-lastClaimMs:FREE_EARNING_INTERVAL_MS;
+    if(elapsed<FREE_EARNING_INTERVAL_MS){
+      const remainingMs=FREE_EARNING_INTERVAL_MS-elapsed;
+      return res.status(409).json({success:false,message:"Your next Free Earning is not ready yet.",remaining_ms:remainingMs,next_claim_at:new Date(nowMs+remainingMs).toISOString()});
+    }
+
+    const now=new Date().toISOString();
+    user.balance=Number((Number(user.balance||0)+FREE_EARNING_AMOUNT).toFixed(8));
+    user.total_earned=Number((Number(user.total_earned||0)+FREE_EARNING_AMOUNT).toFixed(8));
+    user.updated_at=now;
+
+    if(!claim){
+      claim={telegram_id:telegramId,claim_count:0,total_earned:0,last_claim_at:null,created_at:now,updated_at:now};
+      db.data.free_earning_claims.push(claim);
+    }
+    claim.claim_count=Number(claim.claim_count||0)+1;
+    claim.total_earned=Number((Number(claim.total_earned||0)+FREE_EARNING_AMOUNT).toFixed(8));
+    claim.last_claim_at=now; claim.updated_at=now;
+
+    db.data.free_earning_history.push({
+      id:"FE-"+Date.now()+"-"+crypto.randomBytes(4).toString("hex"),
+      telegram_id:telegramId, amount:FREE_EARNING_AMOUNT, type:"DAILY_FREE_EARNING", status:"credited", created_at:now
+    });
+    await db.write();
+
+    void sendMainBotMessage(telegramId,`🎁 Nexora AI — Free Earning Credited\n\n💵 +${FREE_EARNING_AMOUNT.toFixed(3)} USDT\n🟢 Status: Credited\n⏳ Next Free Earning: 24 hours`);
+    res.json({success:true,message:`+${FREE_EARNING_AMOUNT.toFixed(3)} USDT Free Earning credited`,amount:FREE_EARNING_AMOUNT,balance:user.balance,next_claim_at:new Date(nowMs+FREE_EARNING_INTERVAL_MS).toISOString(),remaining_ms:FREE_EARNING_INTERVAL_MS,claim_count:claim.claim_count});
+  } catch(e) {
+    console.error("Free earning claim error:",e);
+    res.status(500).json({success:false,message:"Free Earning claim failed"});
+  }
+});
+
+app.get("/api/admin/free-earning", requireAdmin, async (req,res)=>{
+  try{
+    await ensureFreeEarningData();
+    const users=db.data.users||[];
+    const claims=[...db.data.free_earning_claims].sort((a,b)=>new Date(b.last_claim_at||0)-new Date(a.last_claim_at||0));
+    const history=[...db.data.free_earning_history].sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0));
+    const rewards=[...db.data.free_referral_rewards].sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0));
+    const today=new Date().toISOString().slice(0,10);
+    const todayClaims=history.filter(x=>String(x.created_at||"").slice(0,10)===today);
+    const todayRewards=rewards.filter(x=>String(x.created_at||"").slice(0,10)===today);
+    const totalFree=history.reduce((a,x)=>a+Number(x.amount||0),0);
+    const totalRewards=rewards.reduce((a,x)=>a+Number(x.amount||0),0);
+    const claimRows=claims.map(c=>{const u=users.find(x=>String(x.telegram_id)===String(c.telegram_id))||{};return {...c,first_name:u.first_name||"",last_name:u.last_name||"",username:u.username||"",banned:Boolean(u.banned),balance:Number(u.balance||0)}});
+    const rewardRows=rewards.map(r=>{
+      const ref=users.find(u=>String(u.telegram_id)===String(r.referrer_telegram_id))||{};
+      const rr=users.find(u=>String(u.telegram_id)===String(r.referred_telegram_id))||{};
+      return {...r,referrer_name:[ref.first_name,ref.last_name].filter(Boolean).join(" ")||ref.username||r.referrer_telegram_id,referrer_username:ref.username||"",referred_name:[rr.first_name,rr.last_name].filter(Boolean).join(" ")||rr.username||r.referred_telegram_id,referred_username:rr.username||""};
+    });
+    res.json({
+      success:true,
+      config:{daily_amount:FREE_EARNING_AMOUNT,interval_hours:24,referral_reward:FREE_REFERRAL_REWARD,eligibility:"Telegram-authenticated active users; banned accounts excluded"},
+      summary:{
+        active_users:users.filter(u=>!u.banned).length,claim_users:claims.length,total_claims:history.length,today_claims:todayClaims.length,
+        total_free_earned:Number(totalFree.toFixed(8)),today_free_earned:Number(todayClaims.reduce((a,x)=>a+Number(x.amount||0),0).toFixed(8)),
+        total_referral_rewards:Number(totalRewards.toFixed(8)),referral_reward_events:rewards.length,today_referral_events:todayRewards.length,
+        today_referral_rewards:Number(todayRewards.reduce((a,x)=>a+Number(x.amount||0),0).toFixed(8))
+      },
+      claims:claimRows.slice(0,500),referral_rewards:rewardRows.slice(0,500),history:history.slice(0,500)
+    });
+  }catch(e){console.error("Admin free earning error:",e);res.status(500).json({success:false,message:"Unable to load Free Earning admin data"});}
+});
+
 
 app.get("/", (req, res) => {
   res.json({
@@ -215,7 +368,8 @@ app.post("/api/users", requireTelegramUser, async (req, res) => {
 
       user.updated_at = new Date().toISOString();
     }
-await db.write();
+    await creditFreeReferralReward(user);
+    await db.write();
     return res.json({
       success: true,
       user
@@ -793,6 +947,8 @@ app.get("/api/support/config",(req,res)=>{
 async function startServer() {
   try {
     await initDatabase();
+    await ensureFreeEarningData();
+    await db.write();
 
     setTimeout(() => {
       monitorBep20Deposits();
