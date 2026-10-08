@@ -203,9 +203,14 @@ app.get("/api/free-earning", requireTelegramUser, async (req, res) => {
 });
 
 app.post("/api/free-earning/claim", requireTelegramUser, async (req, res) => {
+  let claimLockClient = null;
+  let claimLockHeld = false;
   try {
-    await ensureFreeEarningData();
     const telegramId=String(req.telegramUser.id);
+    claimLockClient = await pool.connect();
+    await claimLockClient.query("SELECT pg_advisory_lock(hashtext($1))", [`nexora-free-earning:${telegramId}`]);
+    claimLockHeld = true;
+    await ensureFreeEarningData();
     const user=db.data.users.find(u=>String(u.telegram_id)===telegramId);
     if(!freeEarningEligible(user)) return res.status(403).json({success:false,message:"Free Earning is available only to eligible active Telegram users."});
 
@@ -242,6 +247,16 @@ app.post("/api/free-earning/claim", requireTelegramUser, async (req, res) => {
   } catch(e) {
     console.error("Free earning claim error:",e);
     res.status(500).json({success:false,message:"Free Earning claim failed"});
+  } finally {
+    if(claimLockClient){
+      try{
+        if(claimLockHeld){
+          const telegramId=String(req.telegramUser?.id || "");
+          await claimLockClient.query("SELECT pg_advisory_unlock(hashtext($1))", [`nexora-free-earning:${telegramId}`]);
+        }
+      }catch(lockError){ console.warn("Free earning lock release failed:",lockError.message); }
+      claimLockClient.release();
+    }
   }
 });
 

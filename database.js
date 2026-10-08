@@ -6,14 +6,25 @@ const pool = new Pool({
 });
 
 const db = {
-  data: { users: [], deposits: [], withdrawals: [], nft_purchases: [] },
+  data: {
+    users: [],
+    deposits: [],
+    withdrawals: [],
+    nft_purchases: [],
+    free_earning_claims: [],
+    free_earning_history: [],
+    free_referral_rewards: []
+  },
 
   async read() {
-    const [users, deposits, withdrawals, nftPurchases] = await Promise.all([
+    const [users, deposits, withdrawals, nftPurchases, freeEarningClaims, freeEarningHistory, freeReferralRewards] = await Promise.all([
       pool.query("SELECT * FROM users ORDER BY created_at ASC"),
       pool.query("SELECT * FROM deposits ORDER BY created_at ASC"),
       pool.query("SELECT * FROM withdrawals ORDER BY created_at ASC"),
-      pool.query("SELECT * FROM nft_purchases ORDER BY purchased_at ASC")
+      pool.query("SELECT * FROM nft_purchases ORDER BY purchased_at ASC"),
+      pool.query("SELECT * FROM free_earning_claims ORDER BY created_at ASC"),
+      pool.query("SELECT * FROM free_earning_history ORDER BY created_at ASC"),
+      pool.query("SELECT * FROM free_referral_rewards ORDER BY created_at ASC")
     ]);
 
     this.data.users = users.rows.map(u => ({
@@ -44,6 +55,22 @@ const db = {
       mined_cycles: Number(n.mined_cycles || 0),
       total_mined: Number(n.total_mined || 0),
       referral_commission: Number(n.referral_commission || 0)
+    }));
+
+    this.data.free_earning_claims = freeEarningClaims.rows.map(c => ({
+      ...c,
+      claim_count: Number(c.claim_count || 0),
+      total_earned: Number(c.total_earned || 0)
+    }));
+
+    this.data.free_earning_history = freeEarningHistory.rows.map(h => ({
+      ...h,
+      amount: Number(h.amount || 0)
+    }));
+
+    this.data.free_referral_rewards = freeReferralRewards.rows.map(r => ({
+      ...r,
+      amount: Number(r.amount || 0)
     }));
 
     return this;
@@ -149,6 +176,51 @@ const db = {
         );
       }
 
+      for (const c of this.data.free_earning_claims || []) {
+        await client.query(
+          `INSERT INTO free_earning_claims
+            (telegram_id, claim_count, total_earned, last_claim_at, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (telegram_id) DO UPDATE SET
+             claim_count=EXCLUDED.claim_count,
+             total_earned=EXCLUDED.total_earned,
+             last_claim_at=EXCLUDED.last_claim_at,
+             created_at=EXCLUDED.created_at,
+             updated_at=EXCLUDED.updated_at`,
+          [String(c.telegram_id), Number(c.claim_count || 0), Number(c.total_earned || 0),
+           c.last_claim_at || null, c.created_at || new Date().toISOString(), c.updated_at || new Date().toISOString()]
+        );
+      }
+
+      for (const h of this.data.free_earning_history || []) {
+        await client.query(
+          `INSERT INTO free_earning_history
+            (id, telegram_id, amount, type, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (id) DO UPDATE SET
+             telegram_id=EXCLUDED.telegram_id, amount=EXCLUDED.amount,
+             type=EXCLUDED.type, status=EXCLUDED.status, created_at=EXCLUDED.created_at`,
+          [String(h.id), String(h.telegram_id), Number(h.amount || 0), h.type || "DAILY_FREE_EARNING",
+           h.status || "credited", h.created_at || new Date().toISOString()]
+        );
+      }
+
+      for (const r of this.data.free_referral_rewards || []) {
+        await client.query(
+          `INSERT INTO free_referral_rewards
+            (id, referrer_telegram_id, referred_telegram_id, referral_code, amount, reward_type, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (id) DO UPDATE SET
+             referrer_telegram_id=EXCLUDED.referrer_telegram_id,
+             referred_telegram_id=EXCLUDED.referred_telegram_id,
+             referral_code=EXCLUDED.referral_code, amount=EXCLUDED.amount,
+             reward_type=EXCLUDED.reward_type, status=EXCLUDED.status, created_at=EXCLUDED.created_at`,
+          [String(r.id), String(r.referrer_telegram_id), String(r.referred_telegram_id), r.referral_code || "",
+           Number(r.amount || 0), r.reward_type || "FREE_REFERRAL", r.status || "credited",
+           r.created_at || new Date().toISOString()]
+        );
+      }
+
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -227,6 +299,44 @@ async function initDatabase() {
     value TEXT DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS free_earning_claims (
+    telegram_id TEXT PRIMARY KEY,
+    claim_count INTEGER NOT NULL DEFAULT 0,
+    total_earned NUMERIC(30,8) NOT NULL DEFAULT 0,
+    last_claim_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS free_earning_history (
+    id TEXT PRIMARY KEY,
+    telegram_id TEXT NOT NULL,
+    amount NUMERIC(30,8) NOT NULL DEFAULT 0,
+    type TEXT NOT NULL DEFAULT 'DAILY_FREE_EARNING',
+    status TEXT NOT NULL DEFAULT 'credited',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_free_earning_history_telegram
+    ON free_earning_history(telegram_id, created_at);`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS free_referral_rewards (
+    id TEXT PRIMARY KEY,
+    referrer_telegram_id TEXT NOT NULL,
+    referred_telegram_id TEXT NOT NULL,
+    referral_code TEXT DEFAULT '',
+    amount NUMERIC(30,8) NOT NULL DEFAULT 0,
+    reward_type TEXT NOT NULL DEFAULT 'FREE_REFERRAL',
+    status TEXT NOT NULL DEFAULT 'credited',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`);
+
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_free_referral_rewards_referred
+    ON free_referral_rewards(referred_telegram_id);`);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_free_referral_rewards_referrer
+    ON free_referral_rewards(referrer_telegram_id, created_at);`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS unmatched_deposits (
     id BIGSERIAL PRIMARY KEY,
     tx_hash TEXT NOT NULL UNIQUE,
