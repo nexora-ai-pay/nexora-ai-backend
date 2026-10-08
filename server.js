@@ -245,6 +245,7 @@ app.get("/api/admin/free-earning", requireAdmin, async (req,res)=>{
     const totalFree=history.reduce((a,x)=>a+Number(x.amount||0),0);
     const totalRewards=rewards.reduce((a,x)=>a+Number(x.amount||0),0);
     const claimRows=claims.map(c=>{const u=users.find(x=>String(x.telegram_id)===String(c.telegram_id))||{};return {...c,first_name:u.first_name||"",last_name:u.last_name||"",username:u.username||"",banned:Boolean(u.banned),balance:Number(u.balance||0)}});
+    const historyRows=history.map(h=>{const u=users.find(x=>String(x.telegram_id)===String(h.telegram_id))||{};return {...h,first_name:u.first_name||"",last_name:u.last_name||"",username:u.username||"",banned:Boolean(u.banned)}});
     const rewardRows=rewards.map(r=>{
       const ref=users.find(u=>String(u.telegram_id)===String(r.referrer_telegram_id))||{};
       const rr=users.find(u=>String(u.telegram_id)===String(r.referred_telegram_id))||{};
@@ -259,7 +260,7 @@ app.get("/api/admin/free-earning", requireAdmin, async (req,res)=>{
         total_referral_rewards:Number(totalRewards.toFixed(8)),referral_reward_events:rewards.length,today_referral_events:todayRewards.length,
         today_referral_rewards:Number(todayRewards.reduce((a,x)=>a+Number(x.amount||0),0).toFixed(8))
       },
-      claims:claimRows.slice(0,500),referral_rewards:rewardRows.slice(0,500),history:history.slice(0,500)
+      claims:claimRows,referral_rewards:rewardRows,history:historyRows
     });
   }catch(e){console.error("Admin free earning error:",e);res.status(500).json({success:false,message:"Unable to load Free Earning admin data"});}
 });
@@ -1744,7 +1745,15 @@ app.get("/api/admin/deposits/auto-status", requireAdmin, async (req,res)=>{
 
 app.get("/api/admin/deposits/unmatched", requireAdmin, async (req,res)=>{
   const r=await pool.query("SELECT * FROM unmatched_deposits WHERE resolved=false ORDER BY created_at DESC LIMIT 500");
-  res.json({success:true,deposits:r.rows});
+  const pendingUsers=await pool.query(`
+    SELECT DISTINCT d.telegram_id,u.username,u.first_name,u.last_name,u.balance
+    FROM deposits d
+    JOIN users u ON d.telegram_id::text=u.telegram_id::text
+    WHERE d.status='pending' AND COALESCE(u.banned,false)=false
+    ORDER BY d.created_at DESC
+    LIMIT 500
+  `);
+  res.json({success:true,deposits:r.rows,pending_users:pendingUsers.rows});
 });
 app.post("/api/admin/deposits/unmatched/:id/credit", requireAdmin, async (req,res)=>{
   const unmatchedId=String(req.params.id||"").trim();
